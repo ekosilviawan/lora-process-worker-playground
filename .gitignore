@@ -1,0 +1,13 @@
+# binaries
+build/
+
+# go artifacts
+vendor/
+
+# environment
+.env
+
+# editor
+.idea/
+.vscode/
+*.swp

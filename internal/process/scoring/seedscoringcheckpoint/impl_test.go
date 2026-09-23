@@ -8,15 +8,26 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-func TestNotYetSeededFiresOnce(t *testing.T) {
-	if !notYetSeeded(nil, map[common.HString]any{}) {
-		t.Fatal("seeding must run before the cursor exists")
+func TestShouldSeedFiresOnceEligible(t *testing.T) {
+	data := map[common.HString]any{document.DocProcessEligibilityPassed: true}
+	if !shouldSeed(nil, data) {
+		t.Fatal("seeding must run once eligibility has passed and the cursor does not exist yet")
 	}
 }
 
-func TestNotYetSeededNeverReseeds(t *testing.T) {
-	data := map[common.HString]any{document.DocProcessScoringTriggerSeq: 3}
-	if notYetSeeded(nil, data) {
+func TestShouldSeedSkipsIneligibleCustomer(t *testing.T) {
+	data := map[common.HString]any{document.DocProcessEligibilityPassed: false}
+	if shouldSeed(nil, data) {
+		t.Fatal("seeding must not run for a customer who failed eligibility")
+	}
+}
+
+func TestShouldSeedNeverReseeds(t *testing.T) {
+	data := map[common.HString]any{
+		document.DocProcessEligibilityPassed: true,
+		document.DocProcessScoringTriggerSeq: 3,
+	}
+	if shouldSeed(nil, data) {
 		t.Fatal("seeding must not re-fire once the cursor has already advanced past the seed value")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/bfi-finance/lora-process-sdk/framework"
+	"github.com/bfi-finance/lora-process-sdk/framework/defs"
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/mapping"
 	"github.com/bfi-finance/lora-process-sdk/framework/fp"
@@ -44,6 +45,8 @@ type Constructor struct {
 func (c *Constructor) GenerateFunction(
 	_ func(url string) (*framework.APIFunction, error),
 	docFieldCheck func([]common.HString),
+	_ *framework.System,
+	_ *defs.DocumentDescriptor,
 ) error {
 	docFieldCheck(readSet)
 	docFieldCheck(writeSet)

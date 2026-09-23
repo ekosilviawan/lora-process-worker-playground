@@ -13,6 +13,7 @@ import (
 	"lora-process-worker-playground/internal/process"
 	"lora-process-worker-playground/internal/process/document"
 	"lora-process-worker-playground/internal/process/workflow"
+	"lora-process-worker-playground/internal/tasksim"
 )
 
 // DocSchema is the document schema path served by the schema service.
@@ -21,6 +22,14 @@ import (
 const (
 	DocSchema = "/json-schema/business/document/lpw-playground-v0_1_1.schema.json"
 	Tenant    = "playground"
+
+	// TaskQueue is the Temporal task queue the task-master workflow (see
+	// internal/tasksim) runs on. It must match exactly what
+	// framework.System derives internally from DocSchema
+	// ("task_" + lowercased filename minus extension, system.go
+	// LoadDocumentSchema) - that's the queue name CreateTaskMasterFunction
+	// and CreateTaskFunction send their Temporal updates to.
+	TaskQueue = "task_lpw-playground-v0_1_1"
 )
 
 func RunLoraWorker(cfg external.LoraConfig, hc *http.Client) error {
@@ -39,12 +48,18 @@ func RunLoraWorker(cfg external.LoraConfig, hc *http.Client) error {
 	doc := document.AdjustAndMakeDocumentDescriptor(fds)
 	fieldChecker := defs.NewMiniDoc(fds).MustCheckExists
 
-	processSteps, err := buildProcessSteps(system, fieldChecker)
+	processSteps, err := buildProcessSteps(system, fieldChecker, doc)
 	if err != nil {
 		return err
 	}
 
 	system.SetWorkflowFunctions(workflow.MakeWorkflowFunctions(doc))
+
+	go func() {
+		if taskErr := tasksim.StartWorker(cfg, TaskQueue); taskErr != nil {
+			cfg.Logger.Fatal().Err(taskErr).Msg("task-master worker exited with error")
+		}
+	}()
 
 	if runErr := system.Run(
 		doc,
@@ -62,6 +77,6 @@ func RunLoraWorker(cfg external.LoraConfig, hc *http.Client) error {
 	return nil
 }
 
-func buildProcessSteps(system *framework.System, fieldChecker func([]common.HString)) ([]*runtime.ProcessStep, error) {
-	return process.MakeAllProcessSteps(system.LoadAPISchemaAsFunction, fieldChecker)
+func buildProcessSteps(system *framework.System, fieldChecker func([]common.HString), doc *defs.DocumentDescriptor) ([]*runtime.ProcessStep, error) {
+	return process.MakeAllProcessSteps(system.LoadAPISchemaAsFunction, fieldChecker, system, doc)
 }

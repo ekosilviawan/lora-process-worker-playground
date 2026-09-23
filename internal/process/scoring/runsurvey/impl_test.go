@@ -3,6 +3,8 @@ package runsurvey
 import (
 	"testing"
 
+	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
+
 	"lora-process-worker-playground/internal/process/document"
 )
 
@@ -50,5 +52,58 @@ func TestSurveyOutcomeFieldsMatchItsSurveyType(t *testing.T) {
 	}
 	if _, ok := fields[document.DocCustomerBirthDate]; ok {
 		t.Fatal("asset survey outcome must not write identity fields")
+	}
+}
+
+func TestSurveyOutcomeFieldsWritesCursor(t *testing.T) {
+	fields, err := SurveyOutcomeFields("identity", 3)
+	if err != nil {
+		t.Fatalf("SurveyOutcomeFields: %v", err)
+	}
+	if fields[document.DocProcessScoringTriggerSeq] != 3 {
+		t.Fatalf("trigger_seq = %v, want 3", fields[document.DocProcessScoringTriggerSeq])
+	}
+	if fields[document.DocProcessScoringStageToken] != "customer_verification" {
+		t.Fatalf("stage_token = %v, want customer_verification", fields[document.DocProcessScoringStageToken])
+	}
+}
+
+func TestSurveyOutcomeFieldsRejectsUnknownSurveyType(t *testing.T) {
+	if _, err := SurveyOutcomeFields("unknown", 0); err == nil {
+		t.Fatal("expected an error for an unsupported survey type")
+	}
+}
+
+func TestShouldCreateTaskFiresForANewSurveyType(t *testing.T) {
+	data := map[common.HString]any{
+		document.DocProcessScoringSurveyType: "identity",
+		document.DocProcessScoringStageToken: "post_submission",
+	}
+	if !shouldCreateTask(nil, data) {
+		t.Fatal("a survey_type whose stage hasn't been produced yet must create a task")
+	}
+}
+
+func TestShouldCreateTaskSkipsAnAlreadyProducedStage(t *testing.T) {
+	// The survey's own writes (customer.name -> check_name_denylist_pg ->
+	// eligibility_passed) can make this step "impacted" again after it
+	// already completed for this survey_type - this must not re-create a
+	// second, uncompletable task for the same stage.
+	data := map[common.HString]any{
+		document.DocProcessScoringSurveyType: "identity",
+		document.DocProcessScoringStageToken: "customer_verification",
+	}
+	if shouldCreateTask(nil, data) {
+		t.Fatal("must not create a task once stage_token already reflects this survey_type's outcome")
+	}
+}
+
+func TestShouldCreateTaskRejectsUnknownSurveyType(t *testing.T) {
+	data := map[common.HString]any{
+		document.DocProcessScoringSurveyType: "unknown",
+		document.DocProcessScoringStageToken: "post_submission",
+	}
+	if shouldCreateTask(nil, data) {
+		t.Fatal("unknown survey types must fail safe")
 	}
 }

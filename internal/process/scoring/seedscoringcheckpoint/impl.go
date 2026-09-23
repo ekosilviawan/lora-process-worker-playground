@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/bfi-finance/lora-process-sdk/framework"
+	"github.com/bfi-finance/lora-process-sdk/framework/defs"
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/mapping"
 	"github.com/bfi-finance/lora-process-sdk/framework/runtime"
@@ -19,12 +20,9 @@ const ProcessAndActivityName = "seed_scoring_checkpoint_pg"
 // is nil, so it fires as soon as the cursor exists).
 const PostSubmissionStage = "post_submission"
 
-// readSet gates seeding on risk rating rather than eligibility directly:
-// setriskrating only writes a rating once eligibility has passed, so an
-// ineligible (already-rejected) customer never gets a scoring cursor.
-var readSet = []common.HString{
-	document.DocProcessRiskRating,
-}
+// readSet is empty: whether to seed is decided entirely by the precondition
+// below (shouldSeed), not by ordinary field-presence scheduling.
+var readSet = []common.HString{}
 
 var writeSet = []common.HString{
 	document.DocProcessScoringTriggerSeq,
@@ -38,6 +36,8 @@ type Constructor struct {
 func (c *Constructor) GenerateFunction(
 	_ func(url string) (*framework.APIFunction, error),
 	docFieldCheck func([]common.HString),
+	_ *framework.System,
+	_ *defs.DocumentDescriptor,
 ) error {
 	docFieldCheck(readSet)
 	docFieldCheck(writeSet)
@@ -61,15 +61,24 @@ func (c *Constructor) GenerateFunction(
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
-	// Once anyone has written the trigger sequence, this must never fire
-	// again: it always emits the same constant seed values, and re-running
-	// after runsurvey/checkrisksystem have advanced the cursor would reset
-	// scoring progress back to post_submission.
-	step.SetPrecondition(notYetSeeded, common.MakePreConditionSet(nil, []common.HString{document.DocProcessScoringTriggerSeq}))
+	// Fires only for a customer who passed eligibility - an ineligible
+	// (already-rejected) customer must never get a scoring cursor - and only
+	// once: after anyone has written the trigger sequence this must never
+	// fire again, since it always emits the same constant seed values, and
+	// re-running after runsurvey/checkrisksystem have advanced the cursor
+	// would reset scoring progress back to post_submission.
+	step.SetPrecondition(shouldSeed, common.MakePreConditionSet(
+		[]common.HString{document.DocProcessEligibilityPassed},
+		[]common.HString{document.DocProcessScoringTriggerSeq},
+	))
 	return step
 }
 
-func notYetSeeded(_ workflow.Context, data map[common.HString]any) bool {
-	_, exists := data[document.DocProcessScoringTriggerSeq]
-	return !exists
+func shouldSeed(_ workflow.Context, data map[common.HString]any) bool {
+	eligible, _ := data[document.DocProcessEligibilityPassed].(bool)
+	if !eligible {
+		return false
+	}
+	_, alreadySeeded := data[document.DocProcessScoringTriggerSeq]
+	return !alreadySeeded
 }

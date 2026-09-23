@@ -13,9 +13,13 @@ import (
 // - no worker-side registration needed for that one.
 const UpdateNameOverride = "data-forward-override"
 
-const UpdateNameRiskSystemVerdict = "data-forward-risk-system-scored"
-
 // MakeWorkflowFunctions builds the WFFRegistry for this worker.
+//
+// There is no data-forward handler for the Risk System verdict: check_risk_
+// system_pg is a genuine async Temporal activity (system.AsyncPayloadHandler,
+// see internal/process/scoring/checkrisksystem), so the verdict is delivered
+// via a real Temporal activity completion (client.CompleteActivityByID, see
+// cmd/testcli's "verdict" command) rather than a workflow update.
 func MakeWorkflowFunctions(doc *defs.DocumentDescriptor) *runtime.WFFRegistry {
 	registry := runtime.NewWFFRegistry()
 
@@ -25,13 +29,6 @@ func MakeWorkflowFunctions(doc *defs.DocumentDescriptor) *runtime.WFFRegistry {
 		nil, // nil → DefaultWriteIfSetting (always overwrite)
 	)
 	registry.Register(runtime.NewWorkflowFunctionForStructuredHandler(overrideHandler))
-
-	verdictHandler := runtime.NewStructuredDataForwardHandler(
-		UpdateNameRiskSystemVerdict,
-		RiskSystemVerdictToDocFields(doc),
-		nil,
-	)
-	registry.Register(runtime.NewWorkflowFunctionForStructuredHandler(verdictHandler))
 
 	return registry
 }

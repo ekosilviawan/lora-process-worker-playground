@@ -3,12 +3,14 @@ package checkrisksystem
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/bfi-finance/lora-process-sdk/framework"
+	"github.com/bfi-finance/lora-process-sdk/framework/defs"
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/mapping"
-	"github.com/bfi-finance/lora-process-sdk/framework/fp"
 	"github.com/bfi-finance/lora-process-sdk/framework/runtime"
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/workflow"
 
 	"lora-process-worker-playground/internal/process/document"
@@ -26,7 +28,6 @@ var requiredReadSet = []common.HString{
 
 var optionalReadSet = []common.OptionalPath{
 	documentOptional(document.DocCustomerBirthDate),
-	documentOptional(document.DocProcessRiskRating),
 	documentOptional(document.DocProcessAssetCondition),
 	documentOptional(document.DocProcessLoanStructureProvisionalAmount),
 	documentOptional(document.DocProcessLoanStructureLtvSubmission),
@@ -34,8 +35,25 @@ var optionalReadSet = []common.OptionalPath{
 	documentOptional(document.DocProcessFinalReviewConfirmed),
 }
 
+// writeSet is the union of what "calling RS" produces (request_id) and what
+// "applying RS's verdict" produces (status/survey_type/etc). Both happen
+// atomically at completion time, since this is a single genuine async
+// Temporal activity (system.async, via a non-nil asyncHandler): the
+// activity goes pending the moment it's scheduled and only resolves once
+// cmd/testcli's "verdict" command completes it (client.CompleteActivityByID)
+// with the verdict data - mirroring how a real external call and its
+// caller-visible effects land together, with no observable in-between state
+// where only request_id exists.
 var writeSet = []common.HString{
 	document.DocProcessScoringRiskSystemRequestId,
+	document.DocStatus,
+	document.DocStatusReason,
+	document.DocProcessStatusTimestampsApproved,
+	document.DocProcessStatusTimestampsRejected,
+	document.DocProcessStatusTimestampsTerminal,
+	document.DocProcessLoanStructureLtvMax,
+	document.DocProcessScoringRequiredDataSetSatisfied,
+	document.DocProcessScoringSurveyType,
 }
 
 func documentOptional(path common.HString) common.OptionalPath {
@@ -49,6 +67,8 @@ type Constructor struct {
 func (c *Constructor) GenerateFunction(
 	_ func(url string) (*framework.APIFunction, error),
 	docFieldCheck func([]common.HString),
+	_ *framework.System,
+	_ *defs.DocumentDescriptor,
 ) error {
 	docFieldCheck(requiredReadSet)
 	docFieldCheck(writeSet)
@@ -63,21 +83,100 @@ func (c *Constructor) GenerateFunction(
 	convOut.SetOutput(common.MakeWriteSet(writeSet), func(data *map[common.HString]any) (map[common.HString]any, error) { return *data, nil })
 	conv := mapping.NewSimpleConverterFrom(convIn, convOut)
 
-	execFunc := func(_ context.Context, data *map[common.HString]any) (*map[common.HString]any, error) {
-		// trigger_seq round-trips through JSON (ArangoDB storage, data-forward),
-		// which decodes numbers as float64 - fp.As[int] would panic here.
-		seq := fp.MustJsonNumAsInt((*data)[document.DocProcessScoringTriggerSeq])
-		requestID := fmt.Sprintf("playground-rs-%d", seq)
-		out := map[common.HString]any{document.DocProcessScoringRiskSystemRequestId: requestID}
-		return &out, nil
+	// work runs synchronously the instant the activity is scheduled, but per
+	// the async contract (runtime/function.go's Function.Execute) its return
+	// value is discarded the moment the activity goes pending - only
+	// asyncHandler's output, supplied later via a real Temporal completion,
+	// ever reaches the document.
+	work := func(_ context.Context, _ *map[common.HString]any) (*map[common.HString]any, error) {
+		return &map[common.HString]any{}, nil
 	}
 
-	c.f = runtime.NewAnyFunction(ProcessAndActivityName, nil, conv, execFunc, nil)
+	var asyncHandler runtime.AsyncPayloadHandler = func(raw map[string]any) (map[common.HString]any, error) {
+		status, _ := raw["status"].(string)
+		requiredDataSet, _ := raw["required_data_set"].(string)
+		maxLTV, _ := raw["max_ltv"].(float64)
+		rejectReason, _ := raw["reject_reason"].(string)
+
+		surveyType, ok := surveyTypeForDataSet(requiredDataSet)
+		if !ok {
+			return nil, fmt.Errorf("risk system: unsupported required data set %q", requiredDataSet)
+		}
+		mappedStatus, ok := translateStatus(status)
+		if !ok {
+			return nil, fmt.Errorf("risk system: unsupported verdict status %q", status)
+		}
+
+		out := map[common.HString]any{
+			document.DocProcessScoringRiskSystemRequestId:      "playground-rs-" + uuid.New().String(),
+			document.DocStatus:                                 mappedStatus,
+			document.DocProcessLoanStructureLtvMax:             maxLTV,
+			document.DocProcessScoringRequiredDataSetSatisfied: true,
+			document.DocProcessScoringSurveyType:               surveyType,
+		}
+		if rejectReason != "" {
+			out[document.DocStatusReason] = rejectReason
+		}
+		if mappedStatus == "approved" || mappedStatus == "rejected" {
+			document.SetStatusTimestamp(out, mappedStatus)
+		}
+		return out, nil
+	}
+
+	c.f = runtime.NewAnyFunction(ProcessAndActivityName, &asyncHandler, conv, work, nil)
 	return nil
+}
+
+func translateStatus(status string) (string, bool) {
+	mappedStatus, ok := map[string]string{"approved": "approved", "rejected": "rejected", "pending": "processing"}[status]
+	return mappedStatus, ok
+}
+
+// surveyTypeByDataSet maps what Risk System says it still needs onto which
+// survey type the user must complete next. RS decides this internally from
+// its own risk-level calculation (a blackbox to LORA, per the design tenet);
+// LORA only needs the resulting required_data_set identifier. An unknown
+// value fails safe (§2.4: an in-flight worker can be older than RS's release
+// cadence and must not silently stall or guess).
+var surveyTypeByDataSet = map[string]string{
+	"CUSTOMER_VERIFICATION": "identity",
+	"ASSET_REVIEW":          "asset",
+	"FINANCING":             "financing",
+	"INCOME_REVIEW":         "income",
+	"FINAL_REVIEW":          "final_review",
+}
+
+func surveyTypeForDataSet(dataSet string) (string, bool) {
+	surveyType, ok := surveyTypeByDataSet[dataSet]
+	return surveyType, ok
+}
+
+// ValidStatus and ValidRequiredDataSet let a caller validate a verdict
+// before completing this activity (system.CompleteActivityByID). Since this
+// is a genuine async Temporal activity, nothing validates the payload
+// before completion the way a data-forward update's JSON Schema gate used
+// to - an invalid value discovered only inside asyncHandler doesn't just
+// fail this activity, it fails the whole workflow execution. cmd/testcli's
+// "verdict" command calls these first, mirroring where that schema gate
+// (LGS's real proxy validation) used to sit.
+func ValidStatus(status string) bool {
+	_, ok := translateStatus(status)
+	return ok
+}
+
+func ValidRequiredDataSet(dataSet string) bool {
+	_, ok := surveyTypeByDataSet[dataSet]
+	return ok
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	// Async activities stay pending until explicitly completed; the SDK
+	// default startToCloseTimeout (2 minutes, runtime/process.go) would
+	// otherwise time this out and retry it - re-minting a fresh async token
+	// - long before a human/testcli ever gets to call "verdict". Matches
+	// run_survey_pg's own long timeout for the same reason.
+	step.SetTimeout(30 * 24 * time.Hour)
 	step.SetPrecondition(stageGate, common.MakePreConditionSet(
 		[]common.HString{document.DocProcessScoringStageToken},
 		[]common.HString{

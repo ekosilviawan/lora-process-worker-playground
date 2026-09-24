@@ -1,4 +1,4 @@
-package checknamedenylist
+package checkduplicateplate
 
 import (
 	"context"
@@ -13,20 +13,32 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-const ProcessAndActivityName = "check_name_denylist_pg"
+const ProcessAndActivityName = "check_duplicate_license_plate_pg"
 
 var readSet = []common.HString{
-	document.DocCustomerName,
+	document.DocProcessAssetLicensePlate,
+	document.DocStatus,
 }
 
 var writeSet = []common.HString{
-	document.DocProcessEligibilityPassed,
+	document.DocProcessDuplicatePlateCheckPassed,
+	document.DocStatus,
+	document.DocStatusReason,
+	document.DocProcessStatusTimestampsRejected,
+	document.DocProcessStatusTimestampsTerminal,
 }
 
-// deniedNames is the hard-coded name denylist for playground purposes.
-var deniedNames = map[string]bool{
-	"John Doe": true,
+// duplicatePlates is the hard-coded "already has an open loan application"
+// license plate list for playground purposes - one plate must not apply for
+// a loan twice.
+var duplicatePlates = map[string]bool{
+	"B1234XYZ": true,
 }
+
+const (
+	statusRejected       = "rejected"
+	reasonDuplicatePlate = "DUPLICATE_LICENSE_PLATE"
+)
 
 type Constructor struct {
 	f *runtime.Function[any, any]
@@ -56,8 +68,15 @@ func (c *Constructor) GenerateFunction(
 	execFunc := func(_ context.Context, data *map[common.HString]any) (*map[common.HString]any, error) {
 		mOut := make(map[common.HString]any)
 
-		name := fp.As[document.DocTypeCustomerName]((*data)[document.DocCustomerName])
-		mOut[document.DocProcessEligibilityPassed] = !deniedNames[name]
+		plate := fp.As[document.DocTypeProcessAssetLicensePlate]((*data)[document.DocProcessAssetLicensePlate])
+		notDuplicate := !duplicatePlates[plate]
+		mOut[document.DocProcessDuplicatePlateCheckPassed] = notDuplicate
+
+		if !notDuplicate {
+			mOut[document.DocStatus] = statusRejected
+			mOut[document.DocStatusReason] = reasonDuplicatePlate
+			document.SetStatusTimestamp(mOut, statusRejected)
+		}
 
 		return &mOut, nil
 	}
@@ -67,5 +86,7 @@ func (c *Constructor) GenerateFunction(
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
-	return runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	ps := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	ps.SetWriteIfEqual(runtime.None, nil)
+	return ps
 }

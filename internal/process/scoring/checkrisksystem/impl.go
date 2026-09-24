@@ -18,12 +18,19 @@ import (
 
 const ProcessAndActivityName = "check_risk_system_pg"
 
+// requiredReadSet's last two entries - the intake checks' own verdicts - are
+// dual-placed here and in the precondition below (same treatment as
+// stage_token): stageGate reads their VALUES, not just their presence, to
+// enforce "Risk System is never asked about a submission either check has
+// rejected."
 var requiredReadSet = []common.HString{
 	document.DocId,
 	document.DocCustomerNik,
 	document.DocCustomerName,
 	document.DocProcessScoringTriggerSeq,
 	document.DocProcessScoringStageToken,
+	document.DocProcessAgeCheckPassed,
+	document.DocProcessDuplicatePlateCheckPassed,
 }
 
 var optionalReadSet = []common.OptionalPath{
@@ -52,7 +59,6 @@ var writeSet = []common.HString{
 	document.DocProcessStatusTimestampsRejected,
 	document.DocProcessStatusTimestampsTerminal,
 	document.DocProcessLoanStructureLtvMax,
-	document.DocProcessScoringRequiredDataSetSatisfied,
 	document.DocProcessScoringSurveyType,
 }
 
@@ -108,11 +114,10 @@ func (c *Constructor) GenerateFunction(
 		}
 
 		out := map[common.HString]any{
-			document.DocProcessScoringRiskSystemRequestId:      "playground-rs-" + uuid.New().String(),
-			document.DocStatus:                                 mappedStatus,
-			document.DocProcessLoanStructureLtvMax:             maxLTV,
-			document.DocProcessScoringRequiredDataSetSatisfied: true,
-			document.DocProcessScoringSurveyType:               surveyType,
+			document.DocProcessScoringRiskSystemRequestId: "playground-rs-" + uuid.New().String(),
+			document.DocStatus:                            mappedStatus,
+			document.DocProcessLoanStructureLtvMax:        maxLTV,
+			document.DocProcessScoringSurveyType:          surveyType,
 		}
 		if rejectReason != "" {
 			out[document.DocStatusReason] = rejectReason
@@ -171,14 +176,20 @@ func ValidRequiredDataSet(dataSet string) bool {
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	step.SetWriteIfEqual(runtime.None, nil)
 	// Async activities stay pending until explicitly completed; the SDK
 	// default startToCloseTimeout (2 minutes, runtime/process.go) would
 	// otherwise time this out and retry it - re-minting a fresh async token
 	// - long before a human/testcli ever gets to call "verdict". Matches
-	// run_survey_pg's own long timeout for the same reason.
+	// survey's own long timeout for the same reason.
 	step.SetTimeout(30 * 24 * time.Hour)
 	step.SetPrecondition(stageGate, common.MakePreConditionSet(
-		[]common.HString{document.DocProcessScoringStageToken},
+		[]common.HString{
+			document.DocProcessScoringStageToken,
+			document.DocProcessAgeCheckPassed,
+			document.DocProcessDuplicatePlateCheckPassed,
+			document.DocStatus,
+		},
 		[]common.HString{
 			document.DocCustomerBirthDate,
 			document.DocProcessAssetCondition,
@@ -194,7 +205,7 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 // stageGates maps each cursor stage to the survey field that must exist
 // before Risk System is asked to review that stage. Every stage after
 // post_submission is gated on the field the matching survey_type just
-// collected (see runsurvey), so the chain never asks RS about data the
+// collected (see tasking/survey), so the chain never asks RS about data the
 // user has not submitted yet.
 var stageGates = map[string][]common.HString{
 	"post_submission":       nil,
@@ -206,6 +217,11 @@ var stageGates = map[string][]common.HString{
 }
 
 func stageGate(_ workflow.Context, data map[common.HString]any) bool {
+	ageOK, _ := data[document.DocProcessAgeCheckPassed].(bool)
+	plateOK, _ := data[document.DocProcessDuplicatePlateCheckPassed].(bool)
+	if !ageOK || !plateOK {
+		return false
+	}
 	stage, ok := data[document.DocProcessScoringStageToken].(string)
 	if !ok {
 		return false

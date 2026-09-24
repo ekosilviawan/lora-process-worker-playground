@@ -19,10 +19,11 @@ const ProcessAndActivityName = "check_customer_eligibility_pg"
 
 var readSet = []common.HString{
 	document.DocCustomerBirthDate,
+	document.DocStatus,
 }
 
 var writeSet = []common.HString{
-	document.DocProcessEligibilityPassed,
+	document.DocProcessAgeCheckPassed,
 	document.DocStatus,
 	document.DocStatusReason,
 	document.DocProcessStatusTimestampsRejected,
@@ -73,7 +74,7 @@ func (c *Constructor) GenerateFunction(
 		}
 
 		eligible := age >= minAge && age <= maxAge
-		mOut[document.DocProcessEligibilityPassed] = eligible
+		mOut[document.DocProcessAgeCheckPassed] = eligible
 
 		if !eligible {
 			mOut[document.DocStatus] = statusRejected
@@ -89,7 +90,9 @@ func (c *Constructor) GenerateFunction(
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
-	return runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	step.SetWriteIfEqual(runtime.None, nil)
+	return step
 }
 
 func calculateAge(birthDateStr string) (int, error) {

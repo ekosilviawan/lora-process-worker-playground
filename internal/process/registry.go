@@ -7,12 +7,13 @@ import (
 	"github.com/bfi-finance/lora-process-sdk/framework/runtime"
 
 	"lora-process-worker-playground/internal/process/scoring/calculateriskfunding"
+	"lora-process-worker-playground/internal/process/scoring/checkduplicateplate"
 	"lora-process-worker-playground/internal/process/scoring/checkeligibility"
-	"lora-process-worker-playground/internal/process/scoring/checknamedenylist"
 	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
-	"lora-process-worker-playground/internal/process/scoring/runsurvey"
+	"lora-process-worker-playground/internal/process/scoring/checksubmission"
 	"lora-process-worker-playground/internal/process/scoring/seedscoringcheckpoint"
 	"lora-process-worker-playground/internal/process/tasking/master"
+	"lora-process-worker-playground/internal/process/tasking/survey"
 )
 
 // Registriable is implemented by every activity Constructor. system and doc
@@ -32,10 +33,11 @@ type Registriable interface {
 // Add new activities here.
 var registry = []Registriable{
 	&master.Constructor{},
+	&checksubmission.Constructor{},
 	&checkeligibility.Constructor{},
-	&checknamedenylist.Constructor{},
+	&checkduplicateplate.Constructor{},
 	&seedscoringcheckpoint.Constructor{},
-	&runsurvey.Constructor{},
+	&survey.Constructor{},
 	&checkrisksystem.Constructor{},
 	&calculateriskfunding.Constructor{},
 }

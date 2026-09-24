@@ -1,4 +1,4 @@
-package runsurvey
+package survey
 
 import (
 	"fmt"
@@ -13,23 +13,25 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-const ProcessAndActivityName = "run_survey_pg"
+const ProcessAndActivityName = "survey"
 
 // TaskName identifies this as a real, signal-gated Temporal task (via
-// system.CreateTaskFunction), the same way LTW's "SURVEY" task works in
-// production (lora-partnership-ndf/internal/process/tasking/survey). It only
-// completes when an explicit "task-completion" update arrives (see
-// internal/tasksim and cmd/testcli's "complete-survey" command) - never as a
-// side effect of some other document field changing.
+// system.CreateTaskFunction), the same way LPW's "SURVEY" task works in
+// production (lora-partnership-ndf/internal/process/tasking/survey, which
+// this package now mirrors path-for-path). It only completes when an
+// explicit "task-completion" update arrives (see internal/tasksim and
+// cmd/testcli's "complete-survey" command) - never as a side effect of some
+// other document field changing.
 const TaskName = "SURVEY"
 
-// readSet depends on eligibility_passed so the survey only starts after the
-// initial eligibility chain has settled, and on survey_type so it never
-// runs before Risk System's pre-survey checkpoint has told LORA which
-// survey the user needs to complete next (applyrisksystemverdict writes
-// survey_type from the verdict's required_data_set).
+// readSet depends on survey_type so the survey never runs before Risk
+// System's pre-survey checkpoint has told LORA which survey the user needs
+// to complete next (applyrisksystemverdict writes survey_type from the
+// verdict's required_data_set) - transitively this also can't happen before
+// both intake checks have passed, since nothing seeds the scoring cursor
+// (and so nothing sets survey_type) until seed_scoring_checkpoint_pg's own
+// precondition requires exactly that (see seedscoringcheckpoint.shouldSeed).
 var readSet = []common.HString{
-	document.DocProcessEligibilityPassed,
 	document.DocProcessScoringSurveyType,
 }
 
@@ -40,8 +42,9 @@ var readSet = []common.HString{
 // confirm or supply. Fields also present in writeSet become "pre-filled,
 // editable" once a real form renders WorkerTaskData.Read/.Write together;
 // TriggerRollback stays false (default) on every entry, so none of this
-// reintroduces the customer_name/eligibility_passed cascade the completion-
-// gate precondition below already guards against.
+// reintroduces the self-referential cascade (this step's own writes, e.g.
+// customer.birth_date, are also read back here) the completion-gate
+// precondition below already guards against.
 var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocCustomerBirthDate, Strategy: common.OptionalIgnoreIfLocked},
 	{Path: document.DocCustomerName, Strategy: common.OptionalIgnoreIfLocked},
@@ -170,6 +173,7 @@ func (c *Constructor) GenerateFunction(
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Lazy, []runtime.ProcessStepId{})
+	step.SetWriteIfEqual(runtime.None, nil)
 	// A survey is realistically multiple form pages: each page submit is a
 	// partial completion (WorkerTaskCompletionData.Action == "partial"),
 	// only the last page closes the task. EnablePartialCompletion is valid
@@ -188,12 +192,15 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step.SetRetainDataOnRollback()
 	// Guards against opening a second, uncompletable task for a survey_type
 	// whose outcome is already reflected in stage_token - e.g. the survey's
-	// own writes (customer.name -> check_name_denylist_pg -> eligibility_passed)
-	// can make this step "impacted" again even though nothing about the
-	// actual survey changed. CreateTaskFunction alone stops the task from
-	// auto-*completing*; this precondition stops it from being re-*created*.
+	// own writes (customer.birth_date -> check_customer_eligibility_pg ->
+	// age_check_passed) can make this step "impacted" again even though
+	// nothing about the actual survey changed. CreateTaskFunction alone stops
+	// the task from auto-*completing*; this precondition stops it from being
+	// re-*created*. $.status is also required here (not consumed by
+	// shouldCreateTask, just its presence) so this step waits for
+	// check_submission_pg like every other non-exempt activity.
 	step.SetPrecondition(shouldCreateTask, common.MakePreConditionSet(
-		[]common.HString{document.DocProcessScoringSurveyType},
+		[]common.HString{document.DocProcessScoringSurveyType, document.DocStatus},
 		[]common.HString{document.DocProcessScoringStageToken},
 	))
 	return step

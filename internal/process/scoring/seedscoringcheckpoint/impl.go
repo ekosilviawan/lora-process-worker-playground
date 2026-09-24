@@ -61,22 +61,28 @@ func (c *Constructor) GenerateFunction(
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
-	// Fires only for a customer who passed eligibility - an ineligible
-	// (already-rejected) customer must never get a scoring cursor - and only
-	// once: after anyone has written the trigger sequence this must never
+	step.SetWriteIfEqual(runtime.None, nil)
+	// Fires only once both intake checks have passed - a rejected
+	// (age or duplicate-plate) customer must never get a scoring cursor - and
+	// only once: after anyone has written the trigger sequence this must never
 	// fire again, since it always emits the same constant seed values, and
-	// re-running after runsurvey/checkrisksystem have advanced the cursor
+	// re-running after survey/checkrisksystem have advanced the cursor
 	// would reset scoring progress back to post_submission.
 	step.SetPrecondition(shouldSeed, common.MakePreConditionSet(
-		[]common.HString{document.DocProcessEligibilityPassed},
+		[]common.HString{
+			document.DocProcessAgeCheckPassed,
+			document.DocProcessDuplicatePlateCheckPassed,
+			document.DocStatus,
+		},
 		[]common.HString{document.DocProcessScoringTriggerSeq},
 	))
 	return step
 }
 
 func shouldSeed(_ workflow.Context, data map[common.HString]any) bool {
-	eligible, _ := data[document.DocProcessEligibilityPassed].(bool)
-	if !eligible {
+	ageOK, _ := data[document.DocProcessAgeCheckPassed].(bool)
+	plateOK, _ := data[document.DocProcessDuplicatePlateCheckPassed].(bool)
+	if !ageOK || !plateOK {
 		return false
 	}
 	_, alreadySeeded := data[document.DocProcessScoringTriggerSeq]

@@ -8,10 +8,19 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-func TestStageGate(t *testing.T) {
-	data := map[common.HString]any{
-		document.DocProcessScoringStageToken: "customer_verification",
+// bothChecksPassed seeds the two intake-check flags stageGate now hard-requires,
+// so the tests below keep exercising stage-token gating specifically rather
+// than tripping over the new dual-check gate.
+func bothChecksPassed() map[common.HString]any {
+	return map[common.HString]any{
+		document.DocProcessAgeCheckPassed:            true,
+		document.DocProcessDuplicatePlateCheckPassed: true,
 	}
+}
+
+func TestStageGate(t *testing.T) {
+	data := bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "customer_verification"
 	if stageGate(nil, data) {
 		t.Fatal("customer verification must wait for birth date")
 	}
@@ -23,15 +32,16 @@ func TestStageGate(t *testing.T) {
 }
 
 func TestStageGateFiresImmediatelyForPostSubmission(t *testing.T) {
-	if !stageGate(nil, map[common.HString]any{document.DocProcessScoringStageToken: "post_submission"}) {
+	data := bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "post_submission"
+	if !stageGate(nil, data) {
 		t.Fatal("post_submission has no gate fields and must run before any survey")
 	}
 }
 
 func TestStageGateSupportsLaterCheckpoints(t *testing.T) {
-	data := map[common.HString]any{
-		document.DocProcessScoringStageToken: "asset_review",
-	}
+	data := bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "asset_review"
 	if stageGate(nil, data) {
 		t.Fatal("asset review must wait for the asset survey's findings")
 	}
@@ -40,10 +50,9 @@ func TestStageGateSupportsLaterCheckpoints(t *testing.T) {
 		t.Fatal("asset review should run once its gate field is present")
 	}
 
-	data = map[common.HString]any{
-		document.DocProcessScoringStageToken:          "financing",
-		document.DocProcessLoanStructureLtvSubmission: 0.8,
-	}
+	data = bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "financing"
+	data[document.DocProcessLoanStructureLtvSubmission] = 0.8
 	if !stageGate(nil, data) {
 		t.Fatal("financing should run once the financing survey's findings are present")
 	}
@@ -62,10 +71,33 @@ func TestStageGateSupportsLaterCheckpoints(t *testing.T) {
 }
 
 func TestStageGateRejectsUnknownStage(t *testing.T) {
-	if stageGate(nil, map[common.HString]any{
-		document.DocProcessScoringStageToken: "future_stage",
-	}) {
+	data := bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "future_stage"
+	if stageGate(nil, data) {
 		t.Fatal("unknown stages must fail safe")
+	}
+}
+
+func TestStageGateBlocksUntilBothChecksPassed(t *testing.T) {
+	base := func() map[common.HString]any {
+		return map[common.HString]any{document.DocProcessScoringStageToken: "post_submission"}
+	}
+
+	data := base()
+	data[document.DocProcessAgeCheckPassed] = true
+	if stageGate(nil, data) {
+		t.Fatal("must not run with only the age check passed")
+	}
+
+	data = base()
+	data[document.DocProcessDuplicatePlateCheckPassed] = true
+	if stageGate(nil, data) {
+		t.Fatal("must not run with only the duplicate-plate check passed")
+	}
+
+	data = base()
+	if stageGate(nil, data) {
+		t.Fatal("must not run with neither check passed")
 	}
 }
 

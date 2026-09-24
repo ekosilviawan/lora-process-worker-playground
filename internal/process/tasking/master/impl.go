@@ -30,5 +30,7 @@ func (c *Constructor) GenerateFunction(
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
-	return runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Eager, []runtime.ProcessStepId{})
+	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Eager, []runtime.ProcessStepId{})
+	step.SetWriteIfEqual(runtime.None, nil)
+	return step
 }

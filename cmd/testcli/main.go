@@ -23,7 +23,7 @@ import (
 
 	"lora-process-worker-playground/internal/config"
 	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
-	"lora-process-worker-playground/internal/process/scoring/runsurvey"
+	"lora-process-worker-playground/internal/process/tasking/survey"
 	"lora-process-worker-playground/internal/process/workflow"
 	"lora-process-worker-playground/internal/tasksim"
 )
@@ -83,7 +83,7 @@ func usage() {
 
 Usage:
   testcli start    -id <workflow-id>
-  testcli inject   -id <workflow-id> [-name ..] [-nik ..] [-birth-date ..] [-field path=value ...] [-bare]
+  testcli inject   -id <workflow-id> [-name ..] [-nik ..] [-birth-date ..] [-license-plate ..] [-field path=value ...] [-bare]
   testcli override -id <workflow-id> -field path=value [-field path=value ...]
   testcli verdict  -id <workflow-id> -dataset <CUSTOMER_VERIFICATION|ASSET_REVIEW|FINANCING|INCOME_REVIEW|FINAL_REVIEW>
                    [-status pending|approved|rejected] [-max-ltv 0] [-reject-reason ..]
@@ -104,7 +104,7 @@ outright if Risk System was never actually asked about the current stage
 (no pending activity to complete).
 
 "complete-survey" simulates a human submitting a page of the currently-open
-SURVEY task: run_survey_pg is a genuine signal-gated Temporal task (system.
+SURVEY task: survey is a genuine signal-gated Temporal task (system.
 CreateTaskFunction), so nothing else can complete it. A real survey is
 multiple form pages - -outcome partial submits one page and leaves the task
 open (the framework mints a fresh task id for the next page); -outcome final
@@ -171,6 +171,7 @@ func cmdInject(ctx context.Context, c client.Client, args []string) error {
 	name := fs.String("name", "John Placeholder", "customer.name")
 	nik := fs.String("nik", "3201010101010001", "customer.nik")
 	birthDate := fs.String("birth-date", "1990-05-20", "customer.birth_date")
+	licensePlate := fs.String("license-plate", "B5678ABC", "process.asset.license_plate")
 	bare := fs.Bool("bare", false, "skip the default identity fields, send only -field overrides")
 	var extra fieldFlags
 	fs.Var(&extra, "field", "additional raw field override, path=value (repeatable), e.g. $.process.loan_structure.ltv_submission=0.5")
@@ -189,6 +190,7 @@ func cmdInject(ctx context.Context, c client.Client, args []string) error {
 		fields["$.customer.name"] = *name
 		fields["$.customer.nik"] = *nik
 		fields["$.customer.birth_date"] = *birthDate
+		fields["$.process.asset.license_plate"] = *licensePlate
 	}
 	for path, val := range extra.parsed() {
 		fields[path] = val
@@ -285,7 +287,7 @@ func cmdCompleteSurvey(ctx context.Context, c client.Client, args []string) erro
 // update a real Task Service would send once a human submits a form page.
 // outcome "partial" sends only fieldOverrides (that page's subset of
 // writable fields, no cursor fields); outcome "final" sends
-// runsurvey.SurveyOutcomeFields' full canned payload (including the cursor
+// survey.SurveyOutcomeFields' full canned payload (including the cursor
 // fields) with fieldOverrides layered on top, and closes the task.
 func completeSurvey(ctx context.Context, c client.Client, id, surveyType, outcome string, seq int, fieldOverrides map[string]any) error {
 	var data map[string]any
@@ -294,7 +296,7 @@ func completeSurvey(ctx context.Context, c client.Client, id, surveyType, outcom
 		action = taskdefs.OutcomePartial
 		data = fieldOverrides
 	} else {
-		fields, err := runsurvey.SurveyOutcomeFields(surveyType, seq)
+		fields, err := survey.SurveyOutcomeFields(surveyType, seq)
 		if err != nil {
 			return err
 		}
@@ -311,15 +313,15 @@ func completeSurvey(ctx context.Context, c client.Client, id, surveyType, outcom
 	if err != nil {
 		return fmt.Errorf("find task master: %w", err)
 	}
-	taskID, err := findPendingTaskID(ctx, c, taskMasterID, runsurvey.TaskName)
+	taskID, err := findPendingTaskID(ctx, c, taskMasterID, survey.TaskName)
 	if err != nil {
-		return fmt.Errorf("find pending %s task: %w", runsurvey.TaskName, err)
+		return fmt.Errorf("find pending %s task: %w", survey.TaskName, err)
 	}
 
 	tcd := taskdefs.ServiceTaskCompletionData{
 		Id:       taskdefs.TaskId(taskID),
 		MasterId: taskdefs.TaskId(taskMasterID),
-		Type:     taskdefs.TaskType(runsurvey.TaskName),
+		Type:     taskdefs.TaskType(survey.TaskName),
 		Action:   action,
 		Data:     data,
 	}
@@ -399,7 +401,7 @@ func findTaskMasterIDOnce(ctx context.Context, c client.Client, id string) (stri
 
 // findPendingTaskID queries the task-master workflow (internal/tasksim) for
 // the still-open task of the given type, polling for a few seconds since
-// run_survey_pg's task-create update can still be in flight right after
+// survey's task-create update can still be in flight right after
 // findTaskMasterID resolves.
 func findPendingTaskID(ctx context.Context, c client.Client, taskMasterID string, taskType string) (string, error) {
 	deadline := time.Now().Add(5 * time.Second)
@@ -614,7 +616,7 @@ func rejectedVerdictStep(desc, status, dataset string, maxLTV float64, rejectRea
 }
 
 // surveyCompleteStep simulates a human submitting (and closing) the SURVEY
-// task that the preceding verdict step opened - run_survey_pg no longer
+// task that the preceding verdict step opened - survey no longer
 // completes itself, so every scenario that expects a survey's findings to
 // land must send this after each verdict that advances required_data_set
 // to a new survey_type.
@@ -646,9 +648,10 @@ func note(msg string) scenarioStep {
 // can run - data-set would reject it as already-set.
 func defaultIdentityFields() map[string]any {
 	return map[string]any{
-		"$.customer.name":       "John Placeholder",
-		"$.customer.nik":        "3201010101010001",
-		"$.customer.birth_date": "1990-05-20",
+		"$.customer.name":               "John Placeholder",
+		"$.customer.nik":                "3201010101010001",
+		"$.customer.birth_date":         "1990-05-20",
+		"$.process.asset.license_plate": "B5678ABC",
 	}
 }
 
@@ -715,7 +718,7 @@ var scenarios = map[string][]scenarioStep{
 	},
 	"tc5": {
 		injectIdentityStep(),
-		note("check now: stage_token=post_submission, customer.birth_date/name are still the injected placeholders - run_survey_pg has not run yet"),
+		note("check now: stage_token=post_submission, customer.birth_date/name are still the injected placeholders - survey has not run yet"),
 		verdictStep("post_submission verdict -> CUSTOMER_VERIFICATION", "pending", "CUSTOMER_VERIFICATION", 0, ""),
 		note("the identity SURVEY task is now open and pending - it is a genuine signal-gated Temporal task (system.CreateTaskFunction), so it does NOT auto-complete on its own: birth_date is still the placeholder"),
 		surveyPartialStep("submit page 1 of the identity survey (birth_date only, partial)", "identity", map[string]any{"$.customer.birth_date": "1985-03-15"}),
@@ -730,7 +733,7 @@ var scenarios = map[string][]scenarioStep{
 		verdictStep("customer_verification verdict -> ASSET_REVIEW", "pending", "ASSET_REVIEW", 0, ""),
 		surveyCompleteStep("submit asset survey", "asset", 2),
 		overrideStep("out-of-band birth date correction", map[string]any{"$.customer.birth_date": "1991-01-01"}),
-		note("trigger_seq/stage_token must be unchanged (2 / asset_review) - the seed must never re-fire once progress exists, and this unrelated override must not re-open a SURVEY task for a stage that's already done (run_survey_pg's completion-gate precondition) nor create a new pending check_risk_system_pg activity (its own readset/precondition are untouched by this override)"),
+		note("trigger_seq/stage_token must be unchanged (2 / asset_review) - the seed must never re-fire once progress exists, and this unrelated override must not re-open a SURVEY task for a stage that's already done (survey's completion-gate precondition) nor create a new pending check_risk_system_pg activity (its own readset/precondition are untouched by this override)"),
 	},
 	"tc7": {
 		injectIdentityStep(),

@@ -1,4 +1,4 @@
-package runsurvey
+package survey
 
 import (
 	"testing"
@@ -85,10 +85,11 @@ func TestShouldCreateTaskFiresForANewSurveyType(t *testing.T) {
 }
 
 func TestShouldCreateTaskSkipsAnAlreadyProducedStage(t *testing.T) {
-	// The survey's own writes (customer.name -> check_name_denylist_pg ->
-	// eligibility_passed) can make this step "impacted" again after it
-	// already completed for this survey_type - this must not re-create a
-	// second, uncompletable task for the same stage.
+	// The survey's own writes (customer.birth_date ->
+	// check_customer_eligibility_pg -> age_check_passed) can make this step
+	// "impacted" again after it already completed for this survey_type -
+	// this must not re-create a second, uncompletable task for the same
+	// stage.
 	data := map[common.HString]any{
 		document.DocProcessScoringSurveyType: "identity",
 		document.DocProcessScoringStageToken: "customer_verification",

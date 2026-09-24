@@ -2,7 +2,6 @@ package checkrisksystem
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/bfi-finance/lora-process-sdk/framework"
@@ -23,10 +22,18 @@ const ProcessAndActivityName = "check_risk_system_pg"
 // stage_token): stageGate reads their VALUES, not just their presence, to
 // enforce "Risk System is never asked about a submission either check has
 // rejected."
+//
+// product_type is part of what LPW's (simulated) call to RS includes,
+// alongside the customer identity fields below - RS's own required-data-set
+// decision is made with full knowledge of the loan's product, so a
+// correctly-behaving RS should never request underwriting-v1 for an NDF2W
+// applicant in the first place. applyrisksystemverdict.IsUnderwritingEligible
+// is the backstop for when it does anyway.
 var requiredReadSet = []common.HString{
 	document.DocId,
 	document.DocCustomerNik,
 	document.DocCustomerName,
+	document.DocProcessLoanStructureProductType,
 	document.DocProcessScoringTriggerSeq,
 	document.DocProcessScoringStageToken,
 	document.DocProcessAgeCheckPassed,
@@ -39,27 +46,27 @@ var optionalReadSet = []common.OptionalPath{
 	documentOptional(document.DocProcessLoanStructureProvisionalAmount),
 	documentOptional(document.DocProcessLoanStructureLtvSubmission),
 	documentOptional(document.DocProcessIncomeVerifiedAmount),
-	documentOptional(document.DocProcessFinalReviewConfirmed),
+	documentOptional(document.DocProcessUnderwritingConfirmed),
+	documentOptional(document.DocProcessEnvironmentCheckResult),
 }
 
-// writeSet is the union of what "calling RS" produces (request_id) and what
-// "applying RS's verdict" produces (status/survey_type/etc). Both happen
-// atomically at completion time, since this is a single genuine async
-// Temporal activity (system.async, via a non-nil asyncHandler): the
-// activity goes pending the moment it's scheduled and only resolves once
-// cmd/testcli's "verdict" command completes it (client.CompleteActivityByID)
-// with the verdict data - mirroring how a real external call and its
-// caller-visible effects land together, with no observable in-between state
-// where only request_id exists.
+// writeSet is just "calling RS" 's own output: RS's raw answer, recorded
+// verbatim onto its own $.process.scoring.risk_system.* fields. This
+// activity does NOT interpret the verdict (map required_data_set to
+// survey_type, translate status, or decide underwriting eligibility) - that
+// interpretation happens in applyrisksystemverdict.apply_risk_system_verdict_pg,
+// an ordinary synchronous activity that reads these fields back. It has to
+// live there: this activity's asyncHandler below only ever receives the raw
+// external payload (runtime.AsyncPayloadHandler), never current document
+// state, so it structurally cannot validate the verdict against the
+// document (e.g. checking stage_token/product_type for the underwriting
+// gate) - see applyrisksystemverdict's package comment for the full reasoning.
 var writeSet = []common.HString{
 	document.DocProcessScoringRiskSystemRequestId,
-	document.DocStatus,
-	document.DocStatusReason,
-	document.DocProcessStatusTimestampsApproved,
-	document.DocProcessStatusTimestampsRejected,
-	document.DocProcessStatusTimestampsTerminal,
-	document.DocProcessLoanStructureLtvMax,
-	document.DocProcessScoringSurveyType,
+	document.DocProcessScoringRiskSystemStatus,
+	document.DocProcessScoringRiskSystemRequiredDataSet,
+	document.DocProcessScoringRiskSystemMaxLtv,
+	document.DocProcessScoringRiskSystemRejectReason,
 }
 
 func documentOptional(path common.HString) common.OptionalPath {
@@ -98,80 +105,29 @@ func (c *Constructor) GenerateFunction(
 		return &map[common.HString]any{}, nil
 	}
 
+	// asyncHandler just records what RS said, verbatim - it does not
+	// interpret it (see writeSet's comment above for why that's not this
+	// activity's job).
 	var asyncHandler runtime.AsyncPayloadHandler = func(raw map[string]any) (map[common.HString]any, error) {
 		status, _ := raw["status"].(string)
 		requiredDataSet, _ := raw["required_data_set"].(string)
 		maxLTV, _ := raw["max_ltv"].(float64)
 		rejectReason, _ := raw["reject_reason"].(string)
 
-		surveyType, ok := surveyTypeForDataSet(requiredDataSet)
-		if !ok {
-			return nil, fmt.Errorf("risk system: unsupported required data set %q", requiredDataSet)
-		}
-		mappedStatus, ok := translateStatus(status)
-		if !ok {
-			return nil, fmt.Errorf("risk system: unsupported verdict status %q", status)
-		}
-
 		out := map[common.HString]any{
-			document.DocProcessScoringRiskSystemRequestId: "playground-rs-" + uuid.New().String(),
-			document.DocStatus:                            mappedStatus,
-			document.DocProcessLoanStructureLtvMax:        maxLTV,
-			document.DocProcessScoringSurveyType:          surveyType,
+			document.DocProcessScoringRiskSystemRequestId:       "playground-rs-" + uuid.New().String(),
+			document.DocProcessScoringRiskSystemStatus:          status,
+			document.DocProcessScoringRiskSystemRequiredDataSet: requiredDataSet,
+			document.DocProcessScoringRiskSystemMaxLtv:          maxLTV,
 		}
 		if rejectReason != "" {
-			out[document.DocStatusReason] = rejectReason
-		}
-		if mappedStatus == "approved" || mappedStatus == "rejected" {
-			document.SetStatusTimestamp(out, mappedStatus)
+			out[document.DocProcessScoringRiskSystemRejectReason] = rejectReason
 		}
 		return out, nil
 	}
 
 	c.f = runtime.NewAnyFunction(ProcessAndActivityName, &asyncHandler, conv, work, nil)
 	return nil
-}
-
-func translateStatus(status string) (string, bool) {
-	mappedStatus, ok := map[string]string{"approved": "approved", "rejected": "rejected", "pending": "processing"}[status]
-	return mappedStatus, ok
-}
-
-// surveyTypeByDataSet maps what Risk System says it still needs onto which
-// survey type the user must complete next. RS decides this internally from
-// its own risk-level calculation (a blackbox to LORA, per the design tenet);
-// LORA only needs the resulting required_data_set identifier. An unknown
-// value fails safe (§2.4: an in-flight worker can be older than RS's release
-// cadence and must not silently stall or guess).
-var surveyTypeByDataSet = map[string]string{
-	"CUSTOMER_VERIFICATION": "identity",
-	"ASSET_REVIEW":          "asset",
-	"FINANCING":             "financing",
-	"INCOME_REVIEW":         "income",
-	"FINAL_REVIEW":          "final_review",
-}
-
-func surveyTypeForDataSet(dataSet string) (string, bool) {
-	surveyType, ok := surveyTypeByDataSet[dataSet]
-	return surveyType, ok
-}
-
-// ValidStatus and ValidRequiredDataSet let a caller validate a verdict
-// before completing this activity (system.CompleteActivityByID). Since this
-// is a genuine async Temporal activity, nothing validates the payload
-// before completion the way a data-forward update's JSON Schema gate used
-// to - an invalid value discovered only inside asyncHandler doesn't just
-// fail this activity, it fails the whole workflow execution. cmd/testcli's
-// "verdict" command calls these first, mirroring where that schema gate
-// (LGS's real proxy validation) used to sit.
-func ValidStatus(status string) bool {
-	_, ok := translateStatus(status)
-	return ok
-}
-
-func ValidRequiredDataSet(dataSet string) bool {
-	_, ok := surveyTypeByDataSet[dataSet]
-	return ok
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
@@ -187,14 +143,15 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	// trigger_seq/stage_token change (survey advancing the cursor) makes
 	// planner.Rollback treat this step as "impacted" again - and without
 	// this, Rollback would revert every field this step already wrote for
-	// the *completed* checkpoint (ltv_max, risk_system.request_id,
-	// survey_type) back to unset, purely as a side effect of the next
-	// checkpoint being armed. That silently breaks calculateriskfunding's
-	// optional ltv_max read (TriggerRollback: true): reverted-then-set-again
-	// lands as newlySet, never updated, so calculateriskfunding is never
-	// told to react to Risk System's real cap. Matches survey's own
-	// SetRetainDataOnRollback (tasking/survey/impl.go) for the identical
-	// reason.
+	// the *completed* checkpoint (the raw risk_system.request_id/status/
+	// required_data_set/max_ltv fields) back to unset, purely as a side
+	// effect of the next checkpoint being armed. That would in turn make
+	// applyrisksystemverdict see those fields as newly-set rather than
+	// updated on the NEXT verdict, and silently breaks calculateriskfunding's
+	// optional ltv_max read the same way (see applyrisksystemverdict's own
+	// SetRetainDataOnRollback for the continuation of this chain). Matches
+	// survey's own SetRetainDataOnRollback (tasking/survey/impl.go) for the
+	// identical reason.
 	step.SetRetainDataOnRollback()
 	step.SetPrecondition(stageGate, common.MakePreConditionSet(
 		[]common.HString{
@@ -208,22 +165,25 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 			document.DocProcessAssetCondition,
 			document.DocProcessLoanStructureLtvSubmission,
 			document.DocProcessIncomeVerifiedAmount,
-			document.DocProcessFinalReviewConfirmed,
+			document.DocProcessUnderwritingConfirmed,
+			document.DocProcessEnvironmentCheckResult,
 		},
 	))
-	// Deliberately NOT SetNonDeterministic(): the survey_type/stage_token
-	// self-loop (this step writes survey_type -> survey mandatorily reads it
-	// and writes stage_token -> this step mandatorily reads stage_token) makes
-	// planner.Rollback mark this step "impacted" again right after every
-	// verdict, before stage_token has actually changed value (Rollback's walk
-	// is reachability-based, not value-diff-based - see planner.go's
-	// impactedSteps). With an unchanged readset, that re-arm is meant to
-	// fast-forward via document.history.MatchInput (workflow.go's
-	// doActivityExec) straight back to the identical verdict just given,
-	// instead of opening a second real pending activity. A genuine re-ask of
-	// Risk System (a real resubmission, e.g. testcli's tc4) always carries a
-	// new trigger_seq, which naturally defeats history-matching on its own -
-	// so nothing here depends on treating this step as non-deterministic.
+	// Deliberately NOT SetNonDeterministic(): the risk_system.*/survey_type/
+	// stage_token self-loop (this step writes the raw risk_system.* fields ->
+	// applyrisksystemverdict mandatorily reads them and writes survey_type ->
+	// survey mandatorily reads survey_type and writes stage_token -> this
+	// step mandatorily reads stage_token) makes planner.Rollback mark this
+	// step "impacted" again right after every verdict, before stage_token has
+	// actually changed value (Rollback's walk is reachability-based, not
+	// value-diff-based - see planner.go's impactedSteps). With an unchanged
+	// readset, that re-arm is meant to fast-forward via
+	// document.history.MatchInput (workflow.go's doActivityExec) straight
+	// back to the identical verdict just given, instead of opening a second
+	// real pending activity. A genuine re-ask of Risk System (a real
+	// resubmission, e.g. testcli's tc4) always carries a new trigger_seq,
+	// which naturally defeats history-matching on its own - so nothing here
+	// depends on treating this step as non-deterministic.
 	return step
 }
 
@@ -237,8 +197,29 @@ var stageGates = map[string][]common.HString{
 	"customer_verification": {document.DocCustomerBirthDate},
 	"asset_review":          {document.DocProcessAssetCondition},
 	"financing":             {document.DocProcessLoanStructureLtvSubmission},
-	"income_review":         {document.DocProcessIncomeVerifiedAmount},
-	"final_review":          {document.DocProcessFinalReviewConfirmed},
+	"underwriting":          {document.DocProcessUnderwritingConfirmed},
+	// financing_confirmation is the checkpoint reached after the multi-page
+	// "normal" survey's third (financing) page; its gate is the field that
+	// page writes, so RS is never asked before all three preceding pages are
+	// in. The survey's fourth and final page (income) then advances the
+	// cursor on to complete_normal_survey.
+	"financing_confirmation": {document.DocProcessLoanStructureLtvSubmission},
+	// complete_normal_survey is the checkpoint reached after the multi-page
+	// "normal" survey's fourth and final (income) page, marking the whole
+	// process as done; its gate is the field that page writes. This is a
+	// dedicated checkpoint, not the retired standalone income_review one.
+	"complete_normal_survey": {document.DocProcessIncomeVerifiedAmount},
+	// income_confirmation is the checkpoint reached after the "high_risk"
+	// survey's fourth (income) page. It shares its gate field with
+	// complete_normal_survey (both pages write the same income field), but is
+	// a distinct checkpoint name since "high_risk" continues to a fifth page
+	// rather than closing the task here.
+	"income_confirmation": {document.DocProcessIncomeVerifiedAmount},
+	// complete_high_risk_survey is the checkpoint reached after the
+	// "high_risk" survey's fifth and final (environment_check) page, marking
+	// the whole high_risk process as done; its gate is the field that page
+	// writes.
+	"complete_high_risk_survey": {document.DocProcessEnvironmentCheckResult},
 }
 
 func stageGate(_ workflow.Context, data map[common.HString]any) bool {

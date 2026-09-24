@@ -57,16 +57,46 @@ func TestStageGateSupportsLaterCheckpoints(t *testing.T) {
 		t.Fatal("financing should run once the financing survey's findings are present")
 	}
 
-	data[document.DocProcessScoringStageToken] = "income_review"
+	data[document.DocProcessScoringStageToken] = "complete_normal_survey"
 	data[document.DocProcessIncomeVerifiedAmount] = 15000000.0
 	if !stageGate(nil, data) {
-		t.Fatal("income review should run once the income survey's findings are present")
+		t.Fatal("complete_normal_survey should run once the income page's findings are present")
 	}
 
-	data[document.DocProcessScoringStageToken] = "final_review"
-	data[document.DocProcessFinalReviewConfirmed] = true
+	data[document.DocProcessScoringStageToken] = "underwriting"
+	data[document.DocProcessUnderwritingConfirmed] = true
 	if !stageGate(nil, data) {
-		t.Fatal("final review should run once its confirmation is present")
+		t.Fatal("underwriting should run once its confirmation is present")
+	}
+
+	data = bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "financing_confirmation"
+	if stageGate(nil, data) {
+		t.Fatal("financing_confirmation must wait for the normal survey's financing page findings")
+	}
+	data[document.DocProcessLoanStructureLtvSubmission] = 0.8
+	if !stageGate(nil, data) {
+		t.Fatal("financing_confirmation should run once the normal survey's financing page's ltv_submission is present")
+	}
+
+	data = bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "income_confirmation"
+	if stageGate(nil, data) {
+		t.Fatal("income_confirmation must wait for the high_risk survey's income page findings")
+	}
+	data[document.DocProcessIncomeVerifiedAmount] = 15000000.0
+	if !stageGate(nil, data) {
+		t.Fatal("income_confirmation should run once the income page's verified income is present")
+	}
+
+	data = bothChecksPassed()
+	data[document.DocProcessScoringStageToken] = "complete_high_risk_survey"
+	if stageGate(nil, data) {
+		t.Fatal("complete_high_risk_survey must wait for the environment_check page's findings")
+	}
+	data[document.DocProcessEnvironmentCheckResult] = "good"
+	if !stageGate(nil, data) {
+		t.Fatal("complete_high_risk_survey should run once the environment_check page's result is present")
 	}
 }
 
@@ -107,43 +137,7 @@ func TestReadSetUsesCursorAsRequiredTrigger(t *testing.T) {
 	if len(triggers) != len(requiredReadSet) {
 		t.Fatalf("expected only required paths to trigger rollback, got %v", triggers)
 	}
-	if triggers[3] != document.DocProcessScoringTriggerSeq {
-		t.Fatalf("expected trigger sequence to be a required rollback path, got %q", triggers[3])
-	}
-}
-
-func TestTranslateStatus(t *testing.T) {
-	tests := map[string]string{
-		"approved": "approved",
-		"rejected": "rejected",
-		"pending":  "processing",
-	}
-	for input, want := range tests {
-		got, ok := translateStatus(input)
-		if !ok || got != want {
-			t.Fatalf("translateStatus(%q) = %q, %v; want %q, true", input, got, ok, want)
-		}
-	}
-	if _, ok := translateStatus("unknown"); ok {
-		t.Fatal("unknown verdict status must be rejected")
-	}
-}
-
-func TestSurveyTypeForDataSet(t *testing.T) {
-	tests := map[string]string{
-		"CUSTOMER_VERIFICATION": "identity",
-		"ASSET_REVIEW":          "asset",
-		"FINANCING":             "financing",
-		"INCOME_REVIEW":         "income",
-		"FINAL_REVIEW":          "final_review",
-	}
-	for input, want := range tests {
-		got, ok := surveyTypeForDataSet(input)
-		if !ok || got != want {
-			t.Fatalf("surveyTypeForDataSet(%q) = %q, %v; want %q, true", input, got, ok, want)
-		}
-	}
-	if _, ok := surveyTypeForDataSet("UNKNOWN_SET"); ok {
-		t.Fatal("an unrecognised required data set must fail safe, not guess a survey type")
+	if triggers[4] != document.DocProcessScoringTriggerSeq {
+		t.Fatalf("expected trigger sequence to be a required rollback path, got %q", triggers[4])
 	}
 }

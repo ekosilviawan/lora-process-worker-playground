@@ -183,6 +183,19 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	// - long before a human/testcli ever gets to call "verdict". Matches
 	// survey's own long timeout for the same reason.
 	step.SetTimeout(30 * 24 * time.Hour)
+	// This step is reused for every checkpoint, so a later checkpoint's
+	// trigger_seq/stage_token change (survey advancing the cursor) makes
+	// planner.Rollback treat this step as "impacted" again - and without
+	// this, Rollback would revert every field this step already wrote for
+	// the *completed* checkpoint (ltv_max, risk_system.request_id,
+	// survey_type) back to unset, purely as a side effect of the next
+	// checkpoint being armed. That silently breaks calculateriskfunding's
+	// optional ltv_max read (TriggerRollback: true): reverted-then-set-again
+	// lands as newlySet, never updated, so calculateriskfunding is never
+	// told to react to Risk System's real cap. Matches survey's own
+	// SetRetainDataOnRollback (tasking/survey/impl.go) for the identical
+	// reason.
+	step.SetRetainDataOnRollback()
 	step.SetPrecondition(stageGate, common.MakePreConditionSet(
 		[]common.HString{
 			document.DocProcessScoringStageToken,
@@ -198,7 +211,19 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 			document.DocProcessFinalReviewConfirmed,
 		},
 	))
-	step.SetNonDeterministic()
+	// Deliberately NOT SetNonDeterministic(): the survey_type/stage_token
+	// self-loop (this step writes survey_type -> survey mandatorily reads it
+	// and writes stage_token -> this step mandatorily reads stage_token) makes
+	// planner.Rollback mark this step "impacted" again right after every
+	// verdict, before stage_token has actually changed value (Rollback's walk
+	// is reachability-based, not value-diff-based - see planner.go's
+	// impactedSteps). With an unchanged readset, that re-arm is meant to
+	// fast-forward via document.history.MatchInput (workflow.go's
+	// doActivityExec) straight back to the identical verdict just given,
+	// instead of opening a second real pending activity. A genuine re-ask of
+	// Risk System (a real resubmission, e.g. testcli's tc4) always carries a
+	// new trigger_seq, which naturally defeats history-matching on its own -
+	// so nothing here depends on treating this step as non-deterministic.
 	return step
 }
 

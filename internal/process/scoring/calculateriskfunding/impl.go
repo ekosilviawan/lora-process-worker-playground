@@ -37,7 +37,7 @@ var readSet = []common.HString{
 // this step is ltv_max's only reader, and its own writes are already
 // SetReExecutionNeutral below, so nothing cascades further.
 var optionalReadSet = []common.OptionalPath{
-	{Path: document.DocProcessLoanStructureLtvMax, Strategy: common.OptionalIgnoreIfLocked, TriggerRollback: true},
+	{Path: document.DocProcessLoanStructureLtvMax, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 }
 
 var writeSet = []common.HString{

@@ -41,10 +41,21 @@ var readSet = []common.HString{
 // lending constraint - alongside whatever this stage is asking them to
 // confirm or supply. Fields also present in writeSet become "pre-filled,
 // editable" once a real form renders WorkerTaskData.Read/.Write together;
-// TriggerRollback stays false (default) on every entry, so none of this
-// reintroduces the self-referential cascade (this step's own writes, e.g.
-// customer.birth_date, are also read back here) the completion-gate
-// precondition below already guards against.
+// TriggerRollback stays false (default) on every entry except max_funding,
+// so none of this reintroduces the self-referential cascade (this step's
+// own writes, e.g. customer.birth_date, are also read back here) the
+// completion-gate precondition below already guards against.
+//
+// max_funding is the one exception: unlike the rest of this list, it isn't
+// raw context the human can eyeball and correct - it's calculateriskfunding's
+// computed output, and the final_review survey's verificator reads it
+// straight to the customer. OptionalWaitIfLocked (matching calculateriskfunding's
+// own read of ltv_max) keeps this step from running off a value mid-recompute
+// in the same tick, and TriggerRollback: true means a later RS cap change
+// (which reruns calculateriskfunding and changes max_funding) re-impacts this
+// step so the verificator sees the corrected figure - SetRetainDataOnRollback
+// below already protects any survey answers already submitted from being wiped
+// out by that rollback.
 var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocCustomerBirthDate, Strategy: common.OptionalIgnoreIfLocked},
 	{Path: document.DocCustomerName, Strategy: common.OptionalIgnoreIfLocked},
@@ -54,11 +65,18 @@ var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocProcessIncomeVerifiedAmount, Strategy: common.OptionalIgnoreIfLocked},
 	{Path: document.DocProcessFinalReviewConfirmed, Strategy: common.OptionalIgnoreIfLocked},
 	{Path: document.DocProcessScoringRiskSystemMaxLtv, Strategy: common.OptionalIgnoreIfLocked},
+	{Path: document.DocProcessLoanStructureMaxFunding, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 }
 
 // writeSet is the union of every survey type's findings plus the cursor
 // fields, exactly what a real submitted form's completion payload would
-// contain.
+// contain. Most of these fields are first set here, but provisional_amount/
+// ltv_submission are the exception: they arrive with the initial DP
+// submission (testcli's cmdInject seeds them, mirroring production's
+// pre_scoring - see calculateriskfunding, whose mandatory readSet depends on
+// them existing before any survey runs). The financing outcome below only
+// revises them, matching production's "surveyor negotiation" update path -
+// it does not originate them.
 var writeSet = []common.HString{
 	document.DocCustomerBirthDate,
 	document.DocCustomerName,
@@ -109,6 +127,8 @@ var surveyOutcomesByType = map[string]surveyOutcome{
 		},
 	},
 	"financing": {
+		// Revises provisional_amount/ltv_submission, doesn't originate them -
+		// see the writeSet comment above.
 		nextStage: "financing",
 		fields: func() map[common.HString]any {
 			return map[common.HString]any{

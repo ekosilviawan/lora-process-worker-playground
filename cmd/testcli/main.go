@@ -16,6 +16,7 @@ import (
 
 	"github.com/bfi-finance/lora-process-sdk/framework/runtime"
 	taskdefs "github.com/bfi-finance/lora-process-sdk/framework/task/defs"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
@@ -82,20 +83,28 @@ func usage() {
 	fmt.Fprint(os.Stderr, `testcli drives the Risk System POC.
 
 Usage:
-  testcli start    -id <workflow-id>
-  testcli inject   -id <workflow-id> [-name ..] [-nik ..] [-birth-date ..] [-license-plate ..] [-field path=value ...] [-bare]
+  testcli start    [-id <workflow-id>]
+  testcli inject   -id <workflow-id> [-name ..] [-nik ..] [-birth-date ..] [-license-plate ..]
+                   [-provisional-amount ..] [-ltv-submission ..] [-field path=value ...] [-bare]
   testcli override -id <workflow-id> -field path=value [-field path=value ...]
   testcli verdict  -id <workflow-id> -dataset <CUSTOMER_VERIFICATION|ASSET_REVIEW|FINANCING|INCOME_REVIEW|FINAL_REVIEW>
                    [-status pending|approved|rejected] [-max-ltv 0] [-reject-reason ..]
   testcli complete-survey -id <workflow-id> -type <identity|asset|financing|income|final_review>
                    [-outcome partial|final] [-seq <n>] [-field path=value ...]
-  testcli tc <tc1|tc2|tc3|tc4|tc5|tc6|tc7> -id <workflow-id> [-wait 2s]
+  testcli tc <tc1|tc2|tc3|tc4|tc5|tc6|tc7> [-id <workflow-id>] [-wait 2s]
   testcli describe -id <workflow-id>
 
+"start" and "tc" begin a brand-new workflow, so -id is optional there and
+defaults to a generated "poc-<uuid>" id when omitted; every other subcommand
+addresses a workflow that must already exist, so -id stays required.
+
 "inject" sets previously-unset fields via the SDK's built-in "data-set" update
-- the same one LGS calls in production for a fresh submission. "override"
-overwrites fields that are already set, via this worker's own
-"data-forward-override" handler; "data-set" refuses that outright.
+- the same one LGS calls in production for a fresh submission, including the
+customer's originally requested provisional_amount/ltv_submission (DP input,
+same as production's pre_scoring source - see calculateriskfunding); the
+financing survey can still revise these later, same as production's surveyor
+negotiation path. "override" overwrites fields that are already set, via this
+worker's own "data-forward-override" handler; "data-set" refuses that outright.
 
 "verdict" delivers a Risk System verdict by completing the pending
 check_risk_system_pg activity directly (client.CompleteActivityByID):
@@ -146,16 +155,24 @@ func dial(cfg *config.Env) (client.Client, string, error) {
 	return c, ns, err
 }
 
+// defaultWorkflowID generates a workflow id for "start" and "tc" when -id is
+// omitted - both begin a brand-new workflow execution, so unlike every other
+// subcommand (which addresses an id that must already exist) there's nothing
+// for the caller to have to invent up front.
+func defaultWorkflowID() string {
+	return "poc-" + uuid.New().String()
+}
+
 // ---- manual subcommands ----
 
 func cmdStart(ctx context.Context, c client.Client, args []string) error {
 	fs := flag.NewFlagSet("start", flag.ExitOnError)
-	id := fs.String("id", "", "workflow id (= document id)")
+	id := fs.String("id", "", "workflow id (= document id); generated if omitted")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *id == "" {
-		return fmt.Errorf("-id is required")
+		*id = defaultWorkflowID()
 	}
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: *id, TaskQueue: taskQueue}, workflowType)
 	if err != nil {
@@ -172,6 +189,8 @@ func cmdInject(ctx context.Context, c client.Client, args []string) error {
 	nik := fs.String("nik", "3201010101010001", "customer.nik")
 	birthDate := fs.String("birth-date", "1990-05-20", "customer.birth_date")
 	licensePlate := fs.String("license-plate", "B5678ABC", "process.asset.license_plate")
+	provisionalAmount := fs.Float64("provisional-amount", 90000, "process.loan_structure.provisional_amount (DP's originally requested amount)")
+	ltvSubmission := fs.Float64("ltv-submission", 0.75, "process.loan_structure.ltv_submission (DP's originally requested LTV)")
 	bare := fs.Bool("bare", false, "skip the default identity fields, send only -field overrides")
 	var extra fieldFlags
 	fs.Var(&extra, "field", "additional raw field override, path=value (repeatable), e.g. $.process.loan_structure.ltv_submission=0.5")
@@ -191,6 +210,8 @@ func cmdInject(ctx context.Context, c client.Client, args []string) error {
 		fields["$.customer.nik"] = *nik
 		fields["$.customer.birth_date"] = *birthDate
 		fields["$.process.asset.license_plate"] = *licensePlate
+		fields["$.process.loan_structure.provisional_amount"] = *provisionalAmount
+		fields["$.process.loan_structure.ltv_submission"] = *ltvSubmission
 	}
 	for path, val := range extra.parsed() {
 		fields[path] = val
@@ -645,13 +666,19 @@ func note(msg string) scenarioStep {
 
 // defaultIdentityFields excludes $.id: the SDK sets it from the workflow ID
 // automatically at workflow start (runtime/workflow.go), before any update
-// can run - data-set would reject it as already-set.
+// can run - data-set would reject it as already-set. It also carries the
+// DP's originally requested provisional_amount/ltv_submission, matching
+// cmdInject's own defaults - calculateriskfunding's readSet requires them
+// before any survey runs (see survey/impl.go's writeSet comment), and the
+// financing survey only revises them later.
 func defaultIdentityFields() map[string]any {
 	return map[string]any{
-		"$.customer.name":               "John Placeholder",
-		"$.customer.nik":                "3201010101010001",
-		"$.customer.birth_date":         "1990-05-20",
-		"$.process.asset.license_plate": "B5678ABC",
+		"$.customer.name":                             "John Placeholder",
+		"$.customer.nik":                              "3201010101010001",
+		"$.customer.birth_date":                       "1990-05-20",
+		"$.process.asset.license_plate":               "B5678ABC",
+		"$.process.loan_structure.provisional_amount": 90000.0,
+		"$.process.loan_structure.ltv_submission":     0.75,
 	}
 }
 
@@ -764,13 +791,13 @@ func cmdScenario(ctx context.Context, c client.Client, args []string) error {
 	}
 
 	fs := flag.NewFlagSet("tc", flag.ExitOnError)
-	id := fs.String("id", "", "workflow id (= document id)")
+	id := fs.String("id", "", "workflow id (= document id); generated if omitted")
 	wait := fs.Duration("wait", 2*time.Second, "max time to wait for pending activities to settle after each step")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
 	if *id == "" {
-		return fmt.Errorf("-id is required")
+		*id = defaultWorkflowID()
 	}
 
 	fmt.Printf("=== %s: starting workflow %s ===\n", name, *id)

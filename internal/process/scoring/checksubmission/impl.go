@@ -22,7 +22,9 @@ const ProcessAndActivityName = "check_submission_pg"
 // readSet is empty: this is the document's first status transition, so it
 // must not wait on any other field - only the precondition below (whether
 // $.status has been set yet) gates it.
-var readSet = []common.HString{}
+var readSet = []common.HString{
+	document.DocId,
+}
 
 var writeSet = []common.HString{
 	document.DocStatus,

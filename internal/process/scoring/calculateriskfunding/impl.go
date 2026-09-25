@@ -93,7 +93,7 @@ func (c *Constructor) GenerateFunction(
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
-	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Eager, []runtime.ProcessStepId{})
+	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
 	step.SetWriteIfEqual(runtime.None, nil)
 	step.SetReExecutionNeutral([]common.HString{document.DocProcessLoanStructureMaxFunding})
 	return step

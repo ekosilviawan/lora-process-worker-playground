@@ -164,8 +164,14 @@ func dial(cfg *config.Env) (client.Client, string, error) {
 // defaultWorkflowID generates a workflow id for "start" and "tc" when -id is
 // omitted - both begin a brand-new workflow execution, so unlike every other
 // subcommand (which addresses an id that must already exist) there's nothing
-// for the caller to have to invent up front.
-func defaultWorkflowID() string {
+// for the caller to have to invent up front. When tc is non-empty (a scenario
+// run), the scenario name is embedded before the uuid so the resulting id is
+// self-describing (e.g. "poc-tc1-<uuid>"); "start" passes "" and gets the bare
+// "poc-<uuid>" form.
+func defaultWorkflowID(tc string) string {
+	if tc != "" {
+		return "poc-" + tc + "-" + uuid.New().String()
+	}
 	return "poc-" + uuid.New().String()
 }
 
@@ -178,7 +184,7 @@ func cmdStart(ctx context.Context, c client.Client, args []string) error {
 		return err
 	}
 	if *id == "" {
-		*id = defaultWorkflowID()
+		*id = defaultWorkflowID("")
 	}
 	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: *id, TaskQueue: taskQueue}, workflowType)
 	if err != nil {
@@ -873,7 +879,7 @@ func cmdScenario(ctx context.Context, c client.Client, args []string) error {
 		return err
 	}
 	if *id == "" {
-		*id = defaultWorkflowID()
+		*id = defaultWorkflowID(name)
 	}
 
 	fmt.Printf("=== %s: starting workflow %s ===\n", name, *id)

@@ -27,7 +27,7 @@ const ProcessAndActivityName = "check_risk_system_pg"
 // alongside the customer identity fields below - RS's own required-data-set
 // decision is made with full knowledge of the loan's product, so a
 // correctly-behaving RS should never request underwriting-v1 for an NDF2W
-// applicant in the first place. applyrisksystemverdict.IsUnderwritingEligible
+// applicant in the first place. checkrisksystemverdict.IsUnderwritingEligible
 // is the backstop for when it does anyway.
 var requiredReadSet = []common.HString{
 	document.DocId,
@@ -54,13 +54,13 @@ var optionalReadSet = []common.OptionalPath{
 // verbatim onto its own $.process.scoring.risk_system.* fields. This
 // activity does NOT interpret the verdict (map required_data_set to
 // survey_type, translate status, or decide underwriting eligibility) - that
-// interpretation happens in applyrisksystemverdict.apply_risk_system_verdict_pg,
+// interpretation happens in checkrisksystemverdict.check_risk_system_pg_verdict,
 // an ordinary synchronous activity that reads these fields back. It has to
 // live there: this activity's asyncHandler below only ever receives the raw
 // external payload (runtime.AsyncPayloadHandler), never current document
 // state, so it structurally cannot validate the verdict against the
 // document (e.g. checking stage_token/product_type for the underwriting
-// gate) - see applyrisksystemverdict's package comment for the full reasoning.
+// gate) - see checkrisksystemverdict's package comment for the full reasoning.
 var writeSet = []common.HString{
 	document.DocProcessScoringRiskSystemRequestId,
 	document.DocProcessScoringRiskSystemStatus,
@@ -70,7 +70,7 @@ var writeSet = []common.HString{
 }
 
 func documentOptional(path common.HString) common.OptionalPath {
-	return common.OptionalPath{Path: path, Strategy: common.OptionalIgnoreIfLocked}
+	return common.OptionalPath{Path: path, Strategy: common.OptionalWaitIfLocked}
 }
 
 type Constructor struct {
@@ -118,7 +118,9 @@ func (c *Constructor) GenerateFunction(
 			document.DocProcessScoringRiskSystemRequestId:       "playground-rs-" + uuid.New().String(),
 			document.DocProcessScoringRiskSystemStatus:          status,
 			document.DocProcessScoringRiskSystemRequiredDataSet: requiredDataSet,
-			document.DocProcessScoringRiskSystemMaxLtv:          maxLTV,
+		}
+		if maxLTV > 0 {
+			out[document.DocProcessScoringRiskSystemMaxLtv] = maxLTV
 		}
 		if rejectReason != "" {
 			out[document.DocProcessScoringRiskSystemRejectReason] = rejectReason
@@ -146,9 +148,9 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	// the *completed* checkpoint (the raw risk_system.request_id/status/
 	// required_data_set/max_ltv fields) back to unset, purely as a side
 	// effect of the next checkpoint being armed. That would in turn make
-	// applyrisksystemverdict see those fields as newly-set rather than
+	// checkrisksystemverdict see those fields as newly-set rather than
 	// updated on the NEXT verdict, and silently breaks calculateriskfunding's
-	// optional ltv_max read the same way (see applyrisksystemverdict's own
+	// optional ltv_max read the same way (see checkrisksystemverdict's own
 	// SetRetainDataOnRollback for the continuation of this chain). Matches
 	// survey's own SetRetainDataOnRollback (tasking/survey/impl.go) for the
 	// identical reason.
@@ -171,7 +173,7 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	))
 	// Deliberately NOT SetNonDeterministic(): the risk_system.*/survey_type/
 	// stage_token self-loop (this step writes the raw risk_system.* fields ->
-	// applyrisksystemverdict mandatorily reads them and writes survey_type ->
+	// checkrisksystemverdict mandatorily reads them and writes survey_type ->
 	// survey mandatorily reads survey_type and writes stage_token -> this
 	// step mandatorily reads stage_token) makes planner.Rollback mark this
 	// step "impacted" again right after every verdict, before stage_token has

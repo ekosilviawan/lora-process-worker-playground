@@ -1,4 +1,4 @@
-package applyrisksystemverdict
+package checkrisksystemverdict
 
 import (
 	"testing"

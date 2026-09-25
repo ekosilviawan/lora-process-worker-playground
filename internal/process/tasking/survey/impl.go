@@ -26,7 +26,7 @@ const TaskName = "SURVEY"
 
 // readSet depends on survey_type so the survey never runs before Risk
 // System's pre-survey checkpoint has told LORA which survey the user needs
-// to complete next (applyrisksystemverdict.apply_risk_system_verdict_pg
+// to complete next (checkrisksystemverdict.check_risk_system_pg_verdict
 // writes survey_type from the verdict's required_data_set, once
 // check_risk_system_pg has recorded it) - transitively this also can't happen before
 // both intake checks have passed, since nothing seeds the scoring cursor
@@ -66,7 +66,7 @@ var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocProcessIncomeVerifiedAmount, Strategy: common.OptionalIgnoreIfLocked},
 	{Path: document.DocProcessUnderwritingConfirmed, Strategy: common.OptionalIgnoreIfLocked},
 	{Path: document.DocProcessEnvironmentCheckResult, Strategy: common.OptionalIgnoreIfLocked},
-	{Path: document.DocProcessScoringRiskSystemMaxLtv, Strategy: common.OptionalIgnoreIfLocked},
+	{Path: document.DocProcessLoanStructureLtvMax, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 	{Path: document.DocProcessLoanStructureMaxFunding, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 }
 
@@ -192,14 +192,14 @@ func standardSurveyPages() []surveyPage {
 var surveyOutcomesByType = map[string]surveyOutcome{
 	// "underwriting" is required_data_set=underwriting-v1's outcome. Unlike
 	// every other entry in this table, reachability isn't governed solely by
-	// stage_token != nextStage: applyrisksystemverdict additionally requires
+	// stage_token != nextStage: checkrisksystemverdict additionally requires
 	// the applicant came through the "high_risk" path (stage_token ==
 	// "complete_high_risk_survey") and the loan's product is NDF4W before it
 	// will even write survey_type=underwriting - see IsUnderwritingEligible
 	// and shouldCreateTask's own defense-in-depth copy of the same check
 	// below. checkrisksystem's asyncHandler has no read access to current
 	// document state (it only ever sees the raw verdict payload), which is
-	// exactly why that validation lives in applyrisksystemverdict instead.
+	// exactly why that validation lives in checkrisksystemverdict instead.
 	"underwriting": {
 		nextStage: "underwriting",
 		pages: singlePage("underwriting", "underwriting", func() map[common.HString]any {
@@ -218,7 +218,7 @@ var surveyOutcomesByType = map[string]surveyOutcome{
 	// re-arms that async trigger - RS re-evaluates after every page, not just
 	// the final one. The trigger then goes pending holding a write lock on
 	// $.process.scoring.survey_type, so the next page's task cannot be
-	// re-created until a verdict completes it (tc8 sends a verdictStep after
+	// re-created until a verdict completes it (tc1 sends a verdictStep after
 	// every page). The first three pages come from standardSurveyPages() -
 	// identity, asset, and financing are collected identically whether the
 	// applicant ends up on "normal" or "high_risk" (see that function's
@@ -380,7 +380,7 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 		panic(err)
 	}
 	// Once this step is impacted by a rollback (e.g. check_risk_system_pg
-	// re-arming apply_risk_system_verdict_pg, which rewrites survey_type -
+	// re-arming check_risk_system_pg_verdict, which rewrites survey_type -
 	// something this step mandatorily reads), planner.Rollback would
 	// otherwise revert every field this step wrote for the *completed*
 	// stage (e.g. wiping the asset survey's own asset.condition back to
@@ -407,7 +407,7 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 // underwritingHighRiskStageToken is the checkpoint the high_risk survey's
 // final page advances stage_token to (surveyOutcomesByType["high_risk"].
 // nextStage). It doubles as the signal that an applicant came through the
-// high_risk path: applyrisksystemverdict writes survey_type but never
+// high_risk path: checkrisksystemverdict writes survey_type but never
 // touches stage_token, so at the moment survey_type first becomes
 // "underwriting", stage_token still holds whichever checkpoint the PRIOR
 // outcome left behind - "complete_high_risk_survey" only if that prior
@@ -423,7 +423,7 @@ const underwritingProduct = "NDF4W"
 // IsUnderwritingEligible is the single definition of "may this document
 // proceed into the underwriting survey": it must have completed the
 // high_risk path (not normal) and be the NDF4W product (not NDF2W).
-// applyrisksystemverdict calls this before ever writing
+// checkrisksystemverdict calls this before ever writing
 // survey_type=underwriting, since checkrisksystem's async verdict handler has
 // no read access to document state to check this itself; shouldCreateTask's
 // own copy below is cheap defense-in-depth, not the primary enforcement.
@@ -444,7 +444,7 @@ func shouldCreateTask(_ workflow.Context, data map[common.HString]any) bool {
 	if surveyType == "underwriting" {
 		productType, _ := data[document.DocProcessLoanStructureProductType].(string)
 		if !IsUnderwritingEligible(stageToken, productType) {
-			// Defense-in-depth: applyrisksystemverdict should already have
+			// Defense-in-depth: checkrisksystemverdict should already have
 			// refused to write survey_type=underwriting for an ineligible
 			// applicant. If it somehow landed here anyway, fail safe rather
 			// than opening the task.

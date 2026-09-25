@@ -24,7 +24,7 @@ import (
 	"go.temporal.io/sdk/converter"
 
 	"lora-process-worker-playground/internal/config"
-	"lora-process-worker-playground/internal/process/scoring/applyrisksystemverdict"
+	"lora-process-worker-playground/internal/process/scoring/checkrisksystemverdict"
 	"lora-process-worker-playground/internal/process/tasking/survey"
 	"lora-process-worker-playground/internal/process/workflow"
 	"lora-process-worker-playground/internal/tasksim"
@@ -92,7 +92,7 @@ Usage:
                    [-status pending|approved|rejected] [-max-ltv 0] [-reject-reason ..]
   testcli complete-survey -id <workflow-id> -type <underwriting|normal|high_risk>
                    [-outcome partial|final] [-seq <n>] [-field path=value ...]
-  testcli tc <tc8|tc9|tc10|tc11> [-id <workflow-id>] [-wait 2s]
+  testcli tc <tc1|tc2|tc3|tc4|tc5|tc6> [-id <workflow-id>] [-wait 2s]
   testcli describe -id <workflow-id>
 
 "start" and "tc" begin a brand-new workflow, so -id is optional there and
@@ -112,11 +112,11 @@ check_risk_system_pg activity directly (client.CompleteActivityByID):
 check_risk_system_pg is a genuine async Temporal activity, so this fails
 outright if Risk System was never actually asked about the current stage
 (no pending activity to complete). check_risk_system_pg only records the raw
-verdict; a separate apply_risk_system_verdict_pg activity then interprets it
+verdict; a separate check_risk_system_pg_verdict activity then interprets it
 (required_data_set -> survey_type, status mapping) and, for underwriting-v1,
 checks that the applicant actually completed the high_risk survey and is the
 NDF4W product - if not, that activity errors and retries indefinitely rather
-than opening the underwriting survey (see tc11).
+than opening the underwriting survey (see tc4).
 
 "complete-survey" simulates a human submitting a page of the currently-open
 SURVEY task: survey is a genuine signal-gated Temporal task (system.
@@ -557,10 +557,10 @@ func sendOverride(ctx context.Context, c client.Client, id string, fields map[st
 // execution. This mirrors where that gate (LGS's real proxy schema
 // validation) would sit in production, ahead of ever reaching the worker.
 func sendVerdict(ctx context.Context, c client.Client, id, status, dataset string, maxLTV float64, rejectReason string) error {
-	if !applyrisksystemverdict.ValidStatus(status) {
+	if !checkrisksystemverdict.ValidStatus(status) {
 		return fmt.Errorf("verdict rejected before sending: status %q is not a recognized value", status)
 	}
-	if !applyrisksystemverdict.ValidRequiredDataSet(dataset) {
+	if !checkrisksystemverdict.ValidRequiredDataSet(dataset) {
 		return fmt.Errorf("verdict rejected before sending: required_data_set %q is not a recognized value", dataset)
 	}
 	activityID, err := findPendingActivityID(ctx, c, id, "check_risk_system_pg")
@@ -627,7 +627,8 @@ func sendUpdate(ctx context.Context, c client.Client, id, updateName string, pay
 // waitUntilIdle gives the workflow a moment to run whatever the last update
 // triggered, then polls until no activity is pending or timeout elapses.
 // It never fails the run outright on timeout - a still-pending activity is
-// exactly what TC3 (unrecognised required_data_set) expects to observe.
+// exactly what an unrecognised required_data_set (a retired scenario, not
+// among the current tc1-tc6) expects to observe.
 func waitUntilIdle(ctx context.Context, c client.Client, id string, timeout time.Duration) error {
 	time.Sleep(300 * time.Millisecond)
 	deadline := time.Now().Add(timeout)
@@ -718,7 +719,7 @@ func injectIdentityStep() scenarioStep {
 }
 
 // injectIdentityStepWithProductType mirrors injectIdentityStep but overrides
-// product_type - used by tc11 to seed an NDF2W applicant. product_type is
+// product_type - used by tc4 to seed an NDF2W applicant. product_type is
 // mutable:false (write-once), so this must happen at the very first inject,
 // not via "override" afterward.
 func injectIdentityStepWithProductType(productType string) scenarioStep {
@@ -729,33 +730,38 @@ func injectIdentityStepWithProductType(productType string) scenarioStep {
 	}}
 }
 
-// tc8 drives the multi-page "normal" survey end to end, terminating directly
+// tc1 drives the multi-page "normal" survey end to end, terminating directly
 // at its own complete_normal_survey verdict - "normal" never reaches
-// underwriting, that's high_risk-only (survey.IsUnderwritingEligible). tc9
+// underwriting, that's high_risk-only (survey.IsUnderwritingEligible). tc2
 // drives the multi-page "high_risk" survey (normal's four shared pages plus
 // its own extra environment_check page) end to end from the very first
-// verdict, then on to the single-page "underwriting" survey; tc10 exercises
+// verdict, then on to the single-page "underwriting" survey; tc3 exercises
 // the scenario that makes standardSurveyPages()'s shared stage tokens matter
 // - a document that starts on "normal" gets escalated to "high_risk"
 // mid-flow (Risk System re-assessing after a bad asset page) without
 // re-submitting already-collected pages, then also reaches underwriting.
-// tc11 proves the underwriting gate itself: an NDF2W applicant who completes
+// tc4 proves the underwriting gate itself: an NDF2W applicant who completes
 // the high_risk survey still never gets an underwriting task, because
-// apply_risk_system_verdict_pg refuses to write survey_type=underwriting for
-// a non-NDF4W product. The granular single-page survey types (identity/
-// asset/financing/income) that tc1-tc7 used to drive directly have been
-// retired - they're only reachable as pages within these multi-page outcomes
-// now (see tasking/survey.surveyOutcomesByType).
+// check_risk_system_pg_verdict refuses to write survey_type=underwriting for
+// a non-NDF4W product. tc5 and tc6 prove status=rejected is a genuine
+// terminal outcome (document.IsTerminalStatus/doc.SetTermination stop the
+// planner exactly as they do for approved) - tc5 rejects immediately at
+// post_submission, before any SURVEY task is ever created; tc6 rejects only
+// after the applicant fully completes the normal survey, same shape as tc1's
+// approval. The granular single-page survey types (identity/asset/financing/
+// income) that an earlier generation of per-checkpoint scenarios used to
+// drive directly have been retired - they're only reachable as pages within
+// these multi-page outcomes now (see tasking/survey.surveyOutcomesByType).
 // check_risk_system_pg is a genuine async Temporal activity (see
 // internal/process/scoring/checkrisksystem) that only records RS's raw
-// verdict; a separate apply_risk_system_verdict_pg activity (see
-// internal/process/scoring/applyrisksystemverdict) interprets it into
+// verdict; a separate check_risk_system_pg_verdict activity (see
+// internal/process/scoring/checkrisksystemverdict) interprets it into
 // survey_type/$.status. check_risk_system_pg stays open per stage until
 // "verdict" completes it - every verdict that opens a new survey stage is
 // followed by the matching survey step, exactly as a real applicant would
 // progress through the journey.
 var scenarios = map[string][]scenarioStep{
-	"tc8": {
+	"tc1": {
 		injectIdentityStep(),
 		verdictStep("post_submission verdict -> survey-normal-v1", "pending", "survey-normal-v1", 0, ""),
 		surveyPageStep("normal survey page 1 (identity) - partial, cursor -> customer_verification", "normal", 0, 1, false),
@@ -763,12 +769,12 @@ var scenarios = map[string][]scenarioStep{
 		surveyPageStep("normal survey page 2 (asset) - partial, cursor -> asset_review", "normal", 1, 2, false),
 		verdictStep("page 2 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
 		surveyPageStep("normal survey page 3 (financing) - partial, cursor -> financing_confirmation", "normal", 2, 3, false),
-		verdictStep("page 3 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
+		verdictStep("page 3 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0.65, ""),
 		surveyPageStep("normal survey page 4 (income) - final, cursor -> complete_normal_survey", "normal", 3, 4, true),
 		verdictStep("complete_normal_survey verdict -> approved directly (max_ltv=0.6 caps the loan; the normal path never reaches underwriting - that's high_risk-only)", "approved", "survey-normal-v1", 0.6, ""),
 		note("survey-normal-v1 mapped to a single 4-page 'normal' SURVEY process: every page advanced the cursor (trigger_seq incremented, stage_token set to that page's checkpoint), deterministically re-arming check_risk_system_pg, so a verdict followed every page; page 4 closed the task and advanced stage_token to complete_normal_survey; the terminal verdict repeats required_data_set=survey-normal-v1 rather than requesting underwriting-v1, since underwriting is reachable only from the high_risk path (survey.IsUnderwritingEligible) - status=approved, terminal timestamps set, loan_structure.max_funding=60000"),
 	},
-	"tc9": {
+	"tc2": {
 		injectIdentityStep(),
 		verdictStep("post_submission verdict -> survey-high-risk-v1 (RS flags this applicant high risk from the start)", "pending", "survey-high-risk-v1", 0, ""),
 		surveyPageStep("high_risk survey page 1 (identity) - partial, cursor -> customer_verification", "high_risk", 0, 1, false),
@@ -783,9 +789,9 @@ var scenarios = map[string][]scenarioStep{
 		verdictStep("complete_high_risk_survey verdict -> underwriting-v1 (max_ltv=0.6 caps the loan; product_type=NDF4W from defaultIdentityFields satisfies the underwriting gate)", "pending", "underwriting-v1", 0.6, ""),
 		surveyCompleteStep("submit underwriting survey", "underwriting", 6),
 		verdictStep("underwriting verdict -> approved", "approved", "underwriting-v1", 0.6, ""),
-		note("survey-high-risk-v1 mapped to a single 5-page 'high_risk' SURVEY process from the start: every page advanced the cursor (trigger_seq incremented, stage_token set to that page's checkpoint), deterministically re-arming check_risk_system_pg, so a verdict followed every page; page 5 closed the task and advanced stage_token to complete_high_risk_survey; apply_risk_system_verdict_pg then accepted underwriting-v1 since stage_token=complete_high_risk_survey and product_type=NDF4W; status=approved, loan_structure.max_funding=60000"),
+		note("survey-high-risk-v1 mapped to a single 5-page 'high_risk' SURVEY process from the start: every page advanced the cursor (trigger_seq incremented, stage_token set to that page's checkpoint), deterministically re-arming check_risk_system_pg, so a verdict followed every page; page 5 closed the task and advanced stage_token to complete_high_risk_survey; check_risk_system_pg_verdict then accepted underwriting-v1 since stage_token=complete_high_risk_survey and product_type=NDF4W; status=approved, loan_structure.max_funding=60000"),
 	},
-	"tc10": {
+	"tc3": {
 		injectIdentityStep(),
 		verdictStep("post_submission verdict -> survey-normal-v1 (starts as a standard applicant)", "pending", "survey-normal-v1", 0, ""),
 		surveyPageStep("normal survey page 1 (identity) - partial, cursor -> customer_verification", "normal", 0, 1, false),
@@ -803,7 +809,7 @@ var scenarios = map[string][]scenarioStep{
 		verdictStep("underwriting verdict -> approved", "approved", "underwriting-v1", 0.6, ""),
 		note("mid-flow escalation: normal's first two pages (identity, asset) were reused as-is under high_risk once RS re-assessed the applicant after a bad asset condition - proving the shared stage tokens (standardSurveyPages) let a document's survey_type escalate without losing already-collected answers; status=approved, loan_structure.max_funding=60000"),
 	},
-	"tc11": {
+	"tc4": {
 		injectIdentityStepWithProductType("NDF2W"),
 		verdictStep("post_submission verdict -> survey-high-risk-v1 (RS flags this applicant high risk from the start)", "pending", "survey-high-risk-v1", 0, ""),
 		surveyPageStep("high_risk survey page 1 (identity) - partial, cursor -> customer_verification", "high_risk", 0, 1, false),
@@ -816,7 +822,7 @@ var scenarios = map[string][]scenarioStep{
 		verdictStep("page 4 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
 		surveyPageStep("high_risk survey page 5 (environment_check) - final, cursor -> complete_high_risk_survey", "high_risk", 4, 5, true),
 		verdictStep("complete_high_risk_survey verdict -> underwriting-v1 (max_ltv=0.6) - but this applicant is NDF2W", "pending", "underwriting-v1", 0.6, ""),
-		note("apply_risk_system_verdict_pg is now failing/retrying indefinitely for this workflow (stage_token=complete_high_risk_survey satisfies the high_risk-path half of the gate, but product_type=NDF2W fails the other half) - check Temporal UI or `describe` to see it as a pending, repeatedly-failing activity rather than a silent stall"),
+		note("check_risk_system_pg_verdict is now failing/retrying indefinitely for this workflow (stage_token=complete_high_risk_survey satisfies the high_risk-path half of the gate, but product_type=NDF2W fails the other half) - check Temporal UI or `describe` to see it as a pending, repeatedly-failing activity rather than a silent stall"),
 		scenarioStep{
 			desc:      "attempt to submit the underwriting survey - expected to fail: NDF2W must never open the underwriting SURVEY task even via the high_risk path",
 			expectErr: true,
@@ -824,22 +830,40 @@ var scenarios = map[string][]scenarioStep{
 				return completeSurvey(ctx, c, id, "underwriting", "final", 6, nil)
 			},
 		},
-		note("survey_type never became 'underwriting' - apply_risk_system_verdict_pg refused to write it, so shouldCreateTask never had an underwriting survey_type to act on and no SURVEY task was ever created for this NDF2W applicant; the workflow stalls in status=processing until someone fixes the inconsistency (e.g. a corrected verdict) - confirm via `describe` (pendingActivities includes a failing apply_risk_system_verdict_pg) or the ArangoDB document (survey_type still high_risk, stage_token=complete_high_risk_survey, product_type=NDF2W)"),
+		note("survey_type never became 'underwriting' - check_risk_system_pg_verdict refused to write it, so shouldCreateTask never had an underwriting survey_type to act on and no SURVEY task was ever created for this NDF2W applicant; the workflow stalls in status=processing until someone fixes the inconsistency (e.g. a corrected verdict) - confirm via `describe` (pendingActivities includes a failing check_risk_system_pg_verdict) or the ArangoDB document (survey_type still high_risk, stage_token=complete_high_risk_survey, product_type=NDF2W)"),
+	},
+	"tc5": {
+		injectIdentityStep(),
+		verdictStep("post_submission verdict -> rejected immediately (RS rejects before any survey is required)", "rejected", "survey-normal-v1", 0, "provisional amount exceeds applicant's income capacity"),
+		note("status=rejected is a terminal state (document.IsTerminalStatus), exactly like approved - doc.SetTermination stops the planner the moment check_risk_system_pg_verdict writes $.status=rejected, even though required_data_set still mapped survey_type=normal in the same write; no SURVEY task is ever created for this applicant. status_reason=the reject reason above, status_timestamps.rejected and status_timestamps.terminal are set, loan_structure.max_funding stays 0. Confirm via `describe` (pendingActivities=0, nothing left to run) or the ArangoDB document (survey_type=normal but no task master ever created)."),
+	},
+	"tc6": {
+		injectIdentityStep(),
+		verdictStep("post_submission verdict -> survey-normal-v1", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 1 (identity) - partial, cursor -> customer_verification", "normal", 0, 1, false),
+		verdictStep("page 1 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 2 (asset) - partial, cursor -> asset_review", "normal", 1, 2, false),
+		verdictStep("page 2 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 3 (financing) - partial, cursor -> financing_confirmation", "normal", 2, 3, false),
+		verdictStep("page 3 advanced the cursor -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 4 (income) - final, cursor -> complete_normal_survey", "normal", 3, 4, true),
+		verdictStep("complete_normal_survey verdict -> rejected (RS rejects only after reviewing the completed survey)", "rejected", "survey-normal-v1", 0, "verified income insufficient to support requested financing"),
+		note("status=rejected is treated identically to approved once mapped (translateStatus/document.SetStatusTimestamp): status_reason=the reject reason above, status_timestamps.rejected and status_timestamps.terminal are set, and the workflow stops exactly as tc1's approval does. Unlike tc5, this rejection only arrives after the applicant fully completed the normal survey - proving rejection is a genuine terminal outcome reachable from anywhere in the flow, not just an early fail-fast path."),
 	},
 }
 
 func cmdScenario(ctx context.Context, c client.Client, args []string) error {
-	// The scenario name is a leading positional argument (`tc tc8 -id ..`),
+	// The scenario name is a leading positional argument (`tc tc1 -id ..`),
 	// but Go's flag package stops parsing flags at the first non-flag token -
 	// it would otherwise swallow -id as a positional arg instead of parsing
 	// it. Peel the name off before handing the rest to the flag set.
 	if len(args) < 1 {
-		return fmt.Errorf("usage: testcli tc <tc8|tc9|tc10|tc11> -id <workflow-id>")
+		return fmt.Errorf("usage: testcli tc <tc1|tc2|tc3|tc4|tc5|tc6> -id <workflow-id>")
 	}
 	name, rest := args[0], args[1:]
 	steps, ok := scenarios[name]
 	if !ok {
-		return fmt.Errorf("unknown scenario %q (want one of tc8, tc9, tc10, tc11)", name)
+		return fmt.Errorf("unknown scenario %q (want one of tc1, tc2, tc3, tc4, tc5, tc6)", name)
 	}
 
 	fs := flag.NewFlagSet("tc", flag.ExitOnError)

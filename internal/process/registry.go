@@ -6,11 +6,11 @@ import (
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
 	"github.com/bfi-finance/lora-process-sdk/framework/runtime"
 
-	"lora-process-worker-playground/internal/process/scoring/applyrisksystemverdict"
 	"lora-process-worker-playground/internal/process/scoring/calculateriskfunding"
 	"lora-process-worker-playground/internal/process/scoring/checkduplicateplate"
 	"lora-process-worker-playground/internal/process/scoring/checkeligibility"
 	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
+	"lora-process-worker-playground/internal/process/scoring/checkrisksystemverdict"
 	"lora-process-worker-playground/internal/process/scoring/checksubmission"
 	"lora-process-worker-playground/internal/process/scoring/seedscoringcheckpoint"
 	"lora-process-worker-playground/internal/process/tasking/master"
@@ -40,7 +40,7 @@ var registry = []Registriable{
 	&seedscoringcheckpoint.Constructor{},
 	&survey.Constructor{},
 	&checkrisksystem.Constructor{},
-	&applyrisksystemverdict.Constructor{},
+	&checkrisksystemverdict.Constructor{},
 	&calculateriskfunding.Constructor{},
 }
 

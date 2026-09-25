@@ -10,7 +10,7 @@ import (
 
 func TestSurveyOutcomesCoverEveryRequiredDataSet(t *testing.T) {
 	// One outcome per survey type the required_data_set mapping in
-	// applyrisksystemverdict can produce; a stage the mapping can select
+	// checkrisksystemverdict can produce; a stage the mapping can select
 	// but this table can't run would silently error every submission.
 	wantTypes := []string{"underwriting", "normal", "high_risk"}
 	for _, surveyType := range wantTypes {
@@ -380,7 +380,7 @@ func TestUnderwritingRequiresNdf4wProduct(t *testing.T) {
 // TestShouldCreateTaskDefendsAgainstIneligibleUnderwriting pins the
 // fail-safe-on-missing-data idiom: if survey_type somehow reaches
 // "underwriting" without product_type present at all (it should never - see
-// applyrisksystemverdict's own gate), this must still refuse to open the
+// checkrisksystemverdict's own gate), this must still refuse to open the
 // task rather than treating a missing field as a pass.
 func TestShouldCreateTaskDefendsAgainstIneligibleUnderwriting(t *testing.T) {
 	data := map[common.HString]any{

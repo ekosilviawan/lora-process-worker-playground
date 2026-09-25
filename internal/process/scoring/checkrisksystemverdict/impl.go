@@ -1,4 +1,4 @@
-// Package applyrisksystemverdict interprets what check_risk_system_pg
+// Package checkrisksystemverdict interprets what check_risk_system_pg
 // recorded from Risk System's raw verdict. It exists as a separate,
 // ordinary (synchronous) activity - not folded into checkrisksystem's own
 // async handler - because checkrisksystem's asyncHandler is a
@@ -7,7 +7,7 @@
 // document state. The underwriting eligibility gate below needs stage_token
 // and product_type from the document, which only an ordinary activity - with
 // a normal readSet like any other Constructor in this repo - can see.
-package applyrisksystemverdict
+package checkrisksystemverdict
 
 import (
 	"context"
@@ -23,7 +23,7 @@ import (
 	"lora-process-worker-playground/internal/process/tasking/survey"
 )
 
-const ProcessAndActivityName = "apply_risk_system_verdict_pg"
+const ProcessAndActivityName = "check_risk_system_pg_verdict"
 
 // requiredReadSet is check_risk_system_pg's own raw recording of RS's
 // verdict - this step doesn't run until that activity has completed.
@@ -49,11 +49,11 @@ var requiredReadSet = []common.HString{
 // otherwise wrongly fail the same gate a second time on a transition that
 // already happened).
 var optionalReadSet = []common.OptionalPath{
-	{Path: document.DocProcessScoringRiskSystemMaxLtv, Strategy: common.OptionalIgnoreIfLocked},
-	{Path: document.DocProcessScoringRiskSystemRejectReason, Strategy: common.OptionalIgnoreIfLocked},
-	{Path: document.DocProcessScoringStageToken, Strategy: common.OptionalIgnoreIfLocked},
-	{Path: document.DocProcessLoanStructureProductType, Strategy: common.OptionalIgnoreIfLocked},
-	{Path: document.DocProcessScoringSurveyType, Strategy: common.OptionalIgnoreIfLocked},
+	{Path: document.DocProcessScoringRiskSystemMaxLtv, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
+	{Path: document.DocProcessScoringRiskSystemRejectReason, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
+	{Path: document.DocProcessScoringStageToken, Strategy: common.OptionalWaitIfLocked},
+	{Path: document.DocProcessLoanStructureProductType, Strategy: common.OptionalWaitIfLocked},
+	{Path: document.DocProcessScoringSurveyType, Strategy: common.OptionalWaitIfLocked},
 }
 
 var writeSet = []common.HString{
@@ -179,11 +179,11 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 
 	surveyType, ok := surveyTypeForDataSet(requiredDataSet)
 	if !ok {
-		return nil, fmt.Errorf("apply risk system verdict: unsupported required data set %q", requiredDataSet)
+		return nil, fmt.Errorf("check risk system verdict: unsupported required data set %q", requiredDataSet)
 	}
 	mappedStatus, ok := translateStatus(status)
 	if !ok {
-		return nil, fmt.Errorf("apply risk system verdict: unsupported verdict status %q", status)
+		return nil, fmt.Errorf("check risk system verdict: unsupported verdict status %q", status)
 	}
 
 	// This is the one gate checkrisksystem's asyncHandler cannot enforce
@@ -194,7 +194,7 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 	// inconsistent test verdict), refuse to write survey_type=underwriting at
 	// all. Returning an error here causes Temporal to retry this activity
 	// indefinitely, surfacing as a visibly stuck/failing
-	// apply_risk_system_verdict_pg activity in Temporal UI - a diagnosable
+	// check_risk_system_pg_verdict activity in Temporal UI - a diagnosable
 	// failure, not a silent stall and not an automatic loan rejection (a
 	// data/integration mismatch between RS and LORA is a bug, not a reason to
 	// reject a customer's loan).
@@ -214,7 +214,7 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 			productType, _ := data[document.DocProcessLoanStructureProductType].(string)
 			if !survey.IsUnderwritingEligible(stageToken, productType) {
 				return nil, fmt.Errorf(
-					"apply risk system verdict: risk system requested underwriting for an ineligible applicant (stage_token=%q, product_type=%q); expected stage_token=complete_high_risk_survey and product_type=NDF4W - Risk System and LORA disagree, needs investigation",
+					"check risk system verdict: risk system requested underwriting for an ineligible applicant (stage_token=%q, product_type=%q); expected stage_token=complete_high_risk_survey and product_type=NDF4W - Risk System and LORA disagree, needs investigation",
 					stageToken, productType,
 				)
 			}
@@ -222,9 +222,11 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 	}
 
 	out := map[common.HString]any{
-		document.DocStatus:                    mappedStatus,
-		document.DocProcessLoanStructureLtvMax: maxLTV,
-		document.DocProcessScoringSurveyType:   surveyType,
+		document.DocStatus:                   mappedStatus,
+		document.DocProcessScoringSurveyType: surveyType,
+	}
+	if maxLTV > 0 {
+		out[document.DocProcessLoanStructureLtvMax] = maxLTV
 	}
 	if rejectReason != "" {
 		out[document.DocStatusReason] = rejectReason

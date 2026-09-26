@@ -1,6 +1,7 @@
 package survey
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
@@ -23,22 +24,33 @@ func TestSurveyOutcomesCoverEveryRequiredDataSet(t *testing.T) {
 	}
 }
 
-func TestSurveyOutcomesAdvanceToTheMatchingStage(t *testing.T) {
+// TestSurveyOutcomesCompleteOnTheirFinalPageField pins that each outcome's
+// completionField is written by its final page and by no earlier page -
+// otherwise shouldCreateTask would close the task early.
+func TestSurveyOutcomesCompleteOnTheirFinalPageField(t *testing.T) {
 	tests := []struct {
 		surveyType string
-		wantStage  string
+		want       common.HString
 	}{
-		{"underwriting", "underwriting"},
-		{"normal", "complete_normal_survey"},
-		{"high_risk", "complete_high_risk_survey"},
+		{"underwriting", document.DocProcessUnderwritingConfirmed},
+		{"normal", document.DocProcessIncomeVerifiedAmount},
+		{"high_risk", document.DocProcessEnvironmentCheckResult},
 	}
 	for _, tt := range tests {
 		outcome, ok := surveyOutcomesByType[tt.surveyType]
 		if !ok {
 			t.Fatalf("missing outcome for survey type %q", tt.surveyType)
 		}
-		if outcome.nextStage != tt.wantStage {
-			t.Fatalf("surveyOutcomesByType[%q].nextStage = %q; want %q", tt.surveyType, outcome.nextStage, tt.wantStage)
+		if outcome.completionField != tt.want {
+			t.Fatalf("surveyOutcomesByType[%q].completionField = %q; want %q", tt.surveyType, outcome.completionField, tt.want)
+		}
+		if _, ok := outcome.finalPage().fields()[tt.want]; !ok {
+			t.Fatalf("%s's final page must write its completion field %q", tt.surveyType, tt.want)
+		}
+		for i, page := range outcome.pages[:len(outcome.pages)-1] {
+			if _, ok := page.fields()[tt.want]; ok {
+				t.Fatalf("%s page %d (%s) must not write the completion field %q", tt.surveyType, i, page.name, tt.want)
+			}
 		}
 	}
 }
@@ -55,7 +67,7 @@ func TestSurveyOutcomeFieldsMatchItsSurveyType(t *testing.T) {
 
 // TestNormalSurveyIsMultiPage pins the shape of the survey-normal-v1 mapping:
 // a single multi-page SURVEY process whose first pages are partial
-// completions and whose last page alone advances the cursor.
+// completions and whose last page alone closes the task.
 func TestNormalSurveyIsMultiPage(t *testing.T) {
 	outcome, ok := surveyOutcomesByType["normal"]
 	if !ok {
@@ -80,32 +92,46 @@ func TestNormalSurveyIsMultiPage(t *testing.T) {
 
 	financing := outcome.pages[2].fields()
 	if _, ok := financing[document.DocProcessLoanStructureLtvSubmission]; !ok {
-		t.Fatal("normal survey's third page must collect ltv_submission (the financing_confirmation stage gate)")
+		t.Fatal("normal survey's third page must revise ltv_submission (what re-asks Risk System after it)")
 	}
 
 	income := outcome.pages[3].fields()
 	if _, ok := income[document.DocProcessIncomeVerifiedAmount]; !ok {
-		t.Fatal("normal survey's final page must collect the verified income (its stage gate)")
+		t.Fatal("normal survey's final page must collect the verified income (its completion field)")
 	}
 }
 
-// TestNormalSurveyAdvancesCursorPerPage pins the key property behind tc8:
-// every page of the multi-page survey writes trigger_seq and stage_token, so
-// each page's submission re-arms check_risk_system_pg (whose required reads
-// are exactly trigger_seq + stage_token), not just the final page.
-func TestNormalSurveyAdvancesCursorPerPage(t *testing.T) {
-	wantStages := []string{"customer_verification", "asset_review", "financing_confirmation", "complete_normal_survey"}
-	for pageIndex, wantStage := range wantStages {
-		fields, err := SurveyPageCompletion("normal", pageIndex, pageIndex+1)
-		if err != nil {
-			t.Fatalf("SurveyPageCompletion(normal, %d): %v", pageIndex, err)
+// TestSurveyPagesBumpTriggerSeq pins the property that re-asks Risk System
+// after every page: each page's payload writes trigger_seq=seq (an update of
+// the previous value, so planner.Rollback re-arms check_risk_system_pg even
+// when the page's own findings are first-time data), and never the retired
+// stage_token.
+func TestSurveyPagesBumpTriggerSeq(t *testing.T) {
+	for surveyType, outcome := range surveyOutcomesByType {
+		for pageIndex := range outcome.pages {
+			fields, err := SurveyPageCompletion(surveyType, pageIndex, pageIndex+1)
+			if err != nil {
+				t.Fatalf("SurveyPageCompletion(%s, %d): %v", surveyType, pageIndex, err)
+			}
+			if fields[document.DocProcessScoringTriggerSeq] != pageIndex+1 {
+				t.Fatalf("%s page %d trigger_seq = %v, want %d", surveyType, pageIndex, fields[document.DocProcessScoringTriggerSeq], pageIndex+1)
+			}
+			if _, ok := fields[document.DocProcessScoringStageToken]; ok {
+				t.Fatalf("%s page %d must not write the retired stage_token", surveyType, pageIndex)
+			}
 		}
-		if fields[document.DocProcessScoringTriggerSeq] != pageIndex+1 {
-			t.Fatalf("page %d trigger_seq = %v, want %d", pageIndex, fields[document.DocProcessScoringTriggerSeq], pageIndex+1)
-		}
-		if fields[document.DocProcessScoringStageToken] != wantStage {
-			t.Fatalf("page %d stage_token = %v, want %q", pageIndex, fields[document.DocProcessScoringStageToken], wantStage)
-		}
+	}
+}
+
+// TestSurveyPageCompletionIsThePageFindingsPlusTriggerSeq pins that a page
+// payload is that page's own findings plus trigger_seq, nothing more.
+func TestSurveyPageCompletionIsThePageFindingsPlusTriggerSeq(t *testing.T) {
+	fields, err := SurveyPageCompletion("normal", 1, 2)
+	if err != nil {
+		t.Fatalf("SurveyPageCompletion(normal, 1): %v", err)
+	}
+	if len(fields) != 2 || fields[document.DocProcessAssetCondition] != surveyAssetCondition || fields[document.DocProcessScoringTriggerSeq] != 2 {
+		t.Fatalf("asset page payload = %v, want only asset.condition=%q and trigger_seq=2", fields, surveyAssetCondition)
 	}
 }
 
@@ -135,32 +161,23 @@ func TestSurveyPagesExposesMultiPageOrder(t *testing.T) {
 	if pages[0].Name != "identity" || pages[1].Name != "asset" || pages[2].Name != "financing" || pages[3].Name != "income" {
 		t.Fatalf("unexpected normal survey page order: %q, %q, %q, %q", pages[0].Name, pages[1].Name, pages[2].Name, pages[3].Name)
 	}
-	wantStages := []string{"customer_verification", "asset_review", "financing_confirmation", "complete_normal_survey"}
-	for i, wantStage := range wantStages {
-		if pages[i].Stage != wantStage {
-			t.Fatalf("normal survey page %d stage = %q, want %q", i, pages[i].Stage, wantStage)
-		}
-	}
 }
 
-func TestSurveyOutcomeFieldsWritesCursor(t *testing.T) {
-	fields, err := SurveyOutcomeFields("normal", 3)
+func TestSurveyOutcomeFieldsIsTheFinalPage(t *testing.T) {
+	fields, err := SurveyOutcomeFields("normal", 4)
 	if err != nil {
 		t.Fatalf("SurveyOutcomeFields: %v", err)
 	}
-	if fields[document.DocProcessScoringTriggerSeq] != 3 {
-		t.Fatalf("trigger_seq = %v, want 3", fields[document.DocProcessScoringTriggerSeq])
-	}
-	if fields[document.DocProcessScoringStageToken] != "complete_normal_survey" {
-		t.Fatalf("stage_token = %v, want complete_normal_survey", fields[document.DocProcessScoringStageToken])
+	if fields[document.DocProcessIncomeVerifiedAmount] != surveyVerifiedIncome {
+		t.Fatalf("normal outcome fields = %v, want the income page's verified income", fields)
 	}
 }
 
 // TestNormalAndHighRiskSharePagesBeforeDiverging pins the structural
 // guarantee mid-flow escalation depends on: "normal" and "high_risk" must
-// collect identity/asset/financing identically (same name, same stage_token)
-// so a document whose survey_type switches from "normal" to "high_risk"
-// mid-flow (e.g. after Risk System re-assesses the applicant post-asset-page)
+// collect identity/asset/financing identically (same name, same fields) so a
+// document whose survey_type switches from "normal" to "high_risk" mid-flow
+// (e.g. after Risk System re-assesses the applicant post-financing-page)
 // never has to re-collect an already-submitted page. See
 // standardSurveyPages's own comment for the full reasoning.
 func TestNormalAndHighRiskSharePagesBeforeDiverging(t *testing.T) {
@@ -170,8 +187,8 @@ func TestNormalAndHighRiskSharePagesBeforeDiverging(t *testing.T) {
 		if normalPages[i].name != highRiskPages[i].name {
 			t.Fatalf("page %d name diverges: normal=%q high_risk=%q", i, normalPages[i].name, highRiskPages[i].name)
 		}
-		if normalPages[i].stage != highRiskPages[i].stage {
-			t.Fatalf("page %d stage diverges: normal=%q high_risk=%q", i, normalPages[i].stage, highRiskPages[i].stage)
+		if !reflect.DeepEqual(normalPages[i].fields(), highRiskPages[i].fields()) {
+			t.Fatalf("page %d fields diverge: normal=%v high_risk=%v", i, normalPages[i].fields(), highRiskPages[i].fields())
 		}
 	}
 }
@@ -195,29 +212,12 @@ func TestHighRiskSurveyIsMultiPage(t *testing.T) {
 
 	income := outcome.pages[3].fields()
 	if _, ok := income[document.DocProcessIncomeVerifiedAmount]; !ok {
-		t.Fatal("high_risk survey's fourth page must collect the verified income (the income_confirmation stage gate)")
+		t.Fatal("high_risk survey's fourth page must collect the verified income")
 	}
 
 	environmentCheck := outcome.pages[4].fields()
 	if _, ok := environmentCheck[document.DocProcessEnvironmentCheckResult]; !ok {
-		t.Fatal("high_risk survey's final page must collect the environment check result (its stage gate)")
-	}
-}
-
-// TestHighRiskSurveyAdvancesCursorPerPage mirrors TestNormalSurveyAdvancesCursorPerPage.
-func TestHighRiskSurveyAdvancesCursorPerPage(t *testing.T) {
-	wantStages := []string{"customer_verification", "asset_review", "financing_confirmation", "income_confirmation", "complete_high_risk_survey"}
-	for pageIndex, wantStage := range wantStages {
-		fields, err := SurveyPageCompletion("high_risk", pageIndex, pageIndex+1)
-		if err != nil {
-			t.Fatalf("SurveyPageCompletion(high_risk, %d): %v", pageIndex, err)
-		}
-		if fields[document.DocProcessScoringTriggerSeq] != pageIndex+1 {
-			t.Fatalf("page %d trigger_seq = %v, want %d", pageIndex, fields[document.DocProcessScoringTriggerSeq], pageIndex+1)
-		}
-		if fields[document.DocProcessScoringStageToken] != wantStage {
-			t.Fatalf("page %d stage_token = %v, want %q", pageIndex, fields[document.DocProcessScoringStageToken], wantStage)
-		}
+		t.Fatal("high_risk survey's final page must collect the environment check result (its completion field)")
 	}
 }
 
@@ -239,44 +239,31 @@ func TestSurveyPagesExposesHighRiskPageOrder(t *testing.T) {
 		t.Fatal("the last high_risk survey page must be the final completion")
 	}
 	wantNames := []string{"identity", "asset", "financing", "income", "environment_check"}
-	wantStages := []string{"customer_verification", "asset_review", "financing_confirmation", "income_confirmation", "complete_high_risk_survey"}
 	for i := range wantNames {
 		if pages[i].Name != wantNames[i] {
 			t.Fatalf("high_risk survey page %d name = %q, want %q", i, pages[i].Name, wantNames[i])
 		}
-		if pages[i].Stage != wantStages[i] {
-			t.Fatalf("high_risk survey page %d stage = %q, want %q", i, pages[i].Stage, wantStages[i])
-		}
-	}
-}
-
-// TestHighRiskSurveyOutcomeFieldsWritesCursor mirrors TestSurveyOutcomeFieldsWritesCursor.
-func TestHighRiskSurveyOutcomeFieldsWritesCursor(t *testing.T) {
-	fields, err := SurveyOutcomeFields("high_risk", 5)
-	if err != nil {
-		t.Fatalf("SurveyOutcomeFields: %v", err)
-	}
-	if fields[document.DocProcessScoringTriggerSeq] != 5 {
-		t.Fatalf("trigger_seq = %v, want 5", fields[document.DocProcessScoringTriggerSeq])
-	}
-	if fields[document.DocProcessScoringStageToken] != "complete_high_risk_survey" {
-		t.Fatalf("stage_token = %v, want complete_high_risk_survey", fields[document.DocProcessScoringStageToken])
 	}
 }
 
 // TestShouldCreateTaskContinuesAcrossSurveyTypeEscalation is the pure-function
 // proof behind the mid-flow escalation design: once Risk System rewrites
-// survey_type from "normal" to "high_risk" partway through (stage_token
-// already at asset_review, from the shared asset page), the task must stay
-// open/continue rather than being skipped - asset_review isn't high_risk's
-// own nextStage, so there's more of high_risk left to collect.
+// survey_type from "normal" to "high_risk" partway through (the shared
+// identity/asset/financing pages already collected), the task must stay
+// open rather than being skipped - high_risk's own completion field
+// (environment_check.result) isn't present yet, so there's more of high_risk
+// left to collect.
 func TestShouldCreateTaskContinuesAcrossSurveyTypeEscalation(t *testing.T) {
 	data := map[common.HString]any{
 		document.DocProcessScoringSurveyType: "high_risk",
-		document.DocProcessScoringStageToken: "asset_review",
 	}
 	if !shouldCreateTask(nil, data) {
 		t.Fatal("escalating survey_type to high_risk mid-flow must keep the task open to collect high_risk's remaining pages")
+	}
+	// Even after "normal"'s own completion field lands, high_risk isn't done.
+	data[document.DocProcessIncomeVerifiedAmount] = surveyVerifiedIncome
+	if !shouldCreateTask(nil, data) {
+		t.Fatal("high_risk must stay open until its own environment_check page is collected")
 	}
 }
 
@@ -289,33 +276,36 @@ func TestSurveyOutcomeFieldsRejectsUnknownSurveyType(t *testing.T) {
 func TestShouldCreateTaskFiresForANewSurveyType(t *testing.T) {
 	data := map[common.HString]any{
 		document.DocProcessScoringSurveyType:        "underwriting",
-		document.DocProcessScoringStageToken:        "complete_high_risk_survey",
+		document.DocProcessEnvironmentCheckResult:   surveyEnvironmentCheckResult,
 		document.DocProcessLoanStructureProductType: "NDF4W",
 	}
 	if !shouldCreateTask(nil, data) {
-		t.Fatal("a survey_type whose stage hasn't been produced yet must create a task")
+		t.Fatal("a survey_type whose outcome hasn't been collected yet must create a task")
 	}
 }
 
-func TestShouldCreateTaskSkipsAnAlreadyProducedStage(t *testing.T) {
+func TestShouldCreateTaskSkipsAnAlreadyCollectedOutcome(t *testing.T) {
 	// A step's own writes elsewhere in the process graph (e.g.
 	// check_customer_eligibility_pg -> age_check_passed) can make this step
 	// "impacted" again after it already completed for this survey_type -
 	// this must not re-create a second, uncompletable task for the same
-	// stage.
-	data := map[common.HString]any{
-		document.DocProcessScoringSurveyType: "underwriting",
-		document.DocProcessScoringStageToken: "underwriting",
-	}
-	if shouldCreateTask(nil, data) {
-		t.Fatal("must not create a task once stage_token already reflects this survey_type's outcome")
+	// outcome.
+	for surveyType, outcome := range surveyOutcomesByType {
+		data := map[common.HString]any{
+			document.DocProcessScoringSurveyType:        surveyType,
+			document.DocProcessEnvironmentCheckResult:   surveyEnvironmentCheckResult,
+			document.DocProcessLoanStructureProductType: "NDF4W",
+			outcome.completionField:                     true,
+		}
+		if shouldCreateTask(nil, data) {
+			t.Errorf("%s: must not create a task once its completion field %q is present", surveyType, outcome.completionField)
+		}
 	}
 }
 
 func TestShouldCreateTaskRejectsUnknownSurveyType(t *testing.T) {
 	data := map[common.HString]any{
 		document.DocProcessScoringSurveyType: "unknown",
-		document.DocProcessScoringStageToken: "post_submission",
 	}
 	if shouldCreateTask(nil, data) {
 		t.Fatal("unknown survey types must fail safe")
@@ -324,19 +314,29 @@ func TestShouldCreateTaskRejectsUnknownSurveyType(t *testing.T) {
 
 func TestIsUnderwritingEligible(t *testing.T) {
 	tests := []struct {
-		name        string
-		stageToken  string
-		productType string
-		want        bool
+		name string
+		data map[common.HString]any
+		want bool
 	}{
-		{"high_risk completed + NDF4W", "complete_high_risk_survey", "NDF4W", true},
-		{"normal completed, not high_risk", "complete_normal_survey", "NDF4W", false},
-		{"high_risk completed but NDF2W", "complete_high_risk_survey", "NDF2W", false},
-		{"neither condition met", "post_submission", "NDF2W", false},
+		{"high_risk completed + NDF4W", map[common.HString]any{
+			document.DocProcessEnvironmentCheckResult:   "good",
+			document.DocProcessLoanStructureProductType: "NDF4W",
+		}, true},
+		{"normal completed, not high_risk", map[common.HString]any{
+			document.DocProcessIncomeVerifiedAmount:     surveyVerifiedIncome,
+			document.DocProcessLoanStructureProductType: "NDF4W",
+		}, false},
+		{"high_risk completed but NDF2W", map[common.HString]any{
+			document.DocProcessEnvironmentCheckResult:   "good",
+			document.DocProcessLoanStructureProductType: "NDF2W",
+		}, false},
+		{"neither condition met", map[common.HString]any{
+			document.DocProcessLoanStructureProductType: "NDF2W",
+		}, false},
 	}
 	for _, tt := range tests {
-		if got := IsUnderwritingEligible(tt.stageToken, tt.productType); got != tt.want {
-			t.Errorf("%s: IsUnderwritingEligible(%q, %q) = %v, want %v", tt.name, tt.stageToken, tt.productType, got, tt.want)
+		if got := IsUnderwritingEligible(tt.data); got != tt.want {
+			t.Errorf("%s: IsUnderwritingEligible = %v, want %v", tt.name, got, tt.want)
 		}
 	}
 }
@@ -348,7 +348,7 @@ func TestIsUnderwritingEligible(t *testing.T) {
 func TestUnderwritingRequiresHighRiskPath(t *testing.T) {
 	data := map[common.HString]any{
 		document.DocProcessScoringSurveyType:        "underwriting",
-		document.DocProcessScoringStageToken:        "complete_normal_survey",
+		document.DocProcessIncomeVerifiedAmount:     surveyVerifiedIncome,
 		document.DocProcessLoanStructureProductType: "NDF4W",
 	}
 	if shouldCreateTask(nil, data) {
@@ -368,7 +368,7 @@ func TestUnderwritingRequiresNdf4wProduct(t *testing.T) {
 	for _, tt := range tests {
 		data := map[common.HString]any{
 			document.DocProcessScoringSurveyType:        "underwriting",
-			document.DocProcessScoringStageToken:        "complete_high_risk_survey",
+			document.DocProcessEnvironmentCheckResult:   "good",
 			document.DocProcessLoanStructureProductType: tt.productType,
 		}
 		if got := shouldCreateTask(nil, data); got != tt.want {
@@ -384,8 +384,8 @@ func TestUnderwritingRequiresNdf4wProduct(t *testing.T) {
 // task rather than treating a missing field as a pass.
 func TestShouldCreateTaskDefendsAgainstIneligibleUnderwriting(t *testing.T) {
 	data := map[common.HString]any{
-		document.DocProcessScoringSurveyType: "underwriting",
-		document.DocProcessScoringStageToken: "complete_high_risk_survey",
+		document.DocProcessScoringSurveyType:      "underwriting",
+		document.DocProcessEnvironmentCheckResult: "good",
 	}
 	if shouldCreateTask(nil, data) {
 		t.Fatal("must fail safe when product_type is missing, not treat it as eligible")

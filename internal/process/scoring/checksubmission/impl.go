@@ -77,8 +77,7 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	// Runs exactly once, before anything else touches $.status: gating on
 	// $.status itself being absent (rather than a real read-set field) is
 	// what makes this the document's first status transition rather than a
-	// second, spurious "new" stamped over whatever later replaced it -
-	// mirrors seedscoringcheckpoint's own re-fire guard.
+	// second, spurious "new" stamped over whatever later replaced it.
 	step.SetPrecondition(shouldVerify, common.MakePreConditionSet(
 		[]common.HString{},
 		[]common.HString{document.DocStatus},

@@ -61,7 +61,7 @@ func TestApplyVerdictPassesForHighRiskNdf4w(t *testing.T) {
 		document.DocProcessScoringRiskSystemRequiredDataSet: "underwriting-v1",
 		document.DocProcessScoringRiskSystemStatus:          "pending",
 		document.DocProcessScoringRiskSystemMaxLtv:          0.6,
-		document.DocProcessScoringStageToken:                "complete_high_risk_survey",
+		document.DocProcessEnvironmentCheckResult:           "good",
 		document.DocProcessLoanStructureProductType:         "NDF4W",
 	})
 	if err != nil {
@@ -75,14 +75,17 @@ func TestApplyVerdictPassesForHighRiskNdf4w(t *testing.T) {
 	}
 }
 
+// TestApplyVerdictRequiresHighRiskPath covers both the normal path (which
+// never writes environment_check.result) and an underwriting request that
+// arrives before the high_risk survey has finished.
 func TestApplyVerdictRequiresHighRiskPath(t *testing.T) {
 	if _, err := applyVerdict(map[common.HString]any{
 		document.DocProcessScoringRiskSystemRequiredDataSet: "underwriting-v1",
 		document.DocProcessScoringRiskSystemStatus:          "pending",
-		document.DocProcessScoringStageToken:                "complete_normal_survey",
+		document.DocProcessIncomeVerifiedAmount:             15000000.0,
 		document.DocProcessLoanStructureProductType:         "NDF4W",
 	}); err == nil {
-		t.Fatal("underwriting requested after the normal path must be rejected")
+		t.Fatal("underwriting requested without a completed high_risk survey must be rejected")
 	}
 }
 
@@ -90,29 +93,24 @@ func TestApplyVerdictRequiresNdf4wProduct(t *testing.T) {
 	if _, err := applyVerdict(map[common.HString]any{
 		document.DocProcessScoringRiskSystemRequiredDataSet: "underwriting-v1",
 		document.DocProcessScoringRiskSystemStatus:          "pending",
-		document.DocProcessScoringStageToken:                "complete_high_risk_survey",
+		document.DocProcessEnvironmentCheckResult:           "good",
 		document.DocProcessLoanStructureProductType:         "NDF2W",
 	}); err == nil {
 		t.Fatal("underwriting requested for an NDF2W applicant must be rejected")
 	}
 }
 
-// TestApplyVerdictSkipsGateOnReconfirmation pins the fix for a real bug found
-// via manual smoke testing (tc9): once survey_type has already transitioned
-// to "underwriting", completing the underwriting survey's own page advances
-// stage_token to "underwriting" itself. Risk System's next verdict (e.g. the
-// final approve/reject) re-arms this step with the SAME required_data_set,
-// but stage_token no longer equals "complete_high_risk_survey" - the gate
-// must not re-fire and reject an already-accepted transition just because
-// the survey it gated has since completed.
-func TestApplyVerdictSkipsGateOnReconfirmation(t *testing.T) {
+// TestApplyVerdictGateStillHoldsAfterUnderwriting pins that the gate is
+// derived from collected data, not a cursor that moves on: a verdict arriving
+// after the underwriting page itself (e.g. the final approval) still sees
+// environment_check.result and product_type unchanged, so it passes.
+func TestApplyVerdictGateStillHoldsAfterUnderwriting(t *testing.T) {
 	out, err := applyVerdict(map[common.HString]any{
 		document.DocProcessScoringRiskSystemRequiredDataSet: "underwriting-v1",
 		document.DocProcessScoringRiskSystemStatus:          "approved",
 		document.DocProcessScoringRiskSystemMaxLtv:          0.6,
-		document.DocProcessScoringStageToken:                "underwriting",
+		document.DocProcessEnvironmentCheckResult:           "good",
 		document.DocProcessLoanStructureProductType:         "NDF4W",
-		document.DocProcessScoringSurveyType:                "underwriting",
 	})
 	if err != nil {
 		t.Fatalf("applyVerdict: %v", err)
@@ -126,9 +124,8 @@ func TestApplyVerdictOtherSurveyTypesUnaffected(t *testing.T) {
 	out, err := applyVerdict(map[common.HString]any{
 		document.DocProcessScoringRiskSystemRequiredDataSet: "survey-normal-v1",
 		document.DocProcessScoringRiskSystemStatus:          "pending",
-		// Deliberately ineligible stage_token/product_type: the gate only
+		// Deliberately ineligible (no environment_check, NDF2W): the gate only
 		// applies to survey_type=="underwriting", so this must still succeed.
-		document.DocProcessScoringStageToken:        "post_submission",
 		document.DocProcessLoanStructureProductType: "NDF2W",
 	})
 	if err != nil {

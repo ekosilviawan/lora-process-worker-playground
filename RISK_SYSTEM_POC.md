@@ -3,7 +3,7 @@
 This playground implements the current shape of the Risk System integration:
 
 - `check_risk_system_pg` is one genuine async Temporal activity (`system.AsyncPayloadHandler`),
-  reused for every checkpoint. It only "calls RS" and records what came back **verbatim**, onto its
+  reused for every re-ask. It only "calls RS" and records what came back **verbatim**, onto its
   own `process.scoring.risk_system.*` fields (`request_id`, `status`, `required_data_set`, `max_ltv`,
   `reject_reason`) — no interpretation. A verdict is delivered by directly completing the pending
   activity (`client.CompleteActivityByID`), which is what `cmd/testcli`'s `verdict` subcommand does.
@@ -13,13 +13,17 @@ This playground implements the current shape of the Risk System integration:
   `max_ltv`. It has to be a separate, non-async activity because `check_risk_system_pg`'s async
   handler (`runtime.AsyncPayloadHandler = func(map[string]any) (map[common.HString]any, error)`) only
   ever receives the raw external payload, never current document state — and the underwriting
-  eligibility gate below (`stage_token`/`product_type`) needs exactly that.
-- `trigger_seq` and `stage_token` are `check_risk_system_pg`'s required reads and the monotonic
-  cursor. Every survey page write — not just a multi-page survey's final page — bumps both, so every
-  page submission deterministically re-arms `check_risk_system_pg`.
-- `stage_token` selects a deterministic data-availability gate table (`checkrisksystem.stageGates`),
-  one entry per checkpoint.
-- Payload fields are optional and use `OptionalIgnoreIfLocked`.
+  eligibility gate below (`environment_check.result`/`product_type`) needs exactly that.
+- **`trigger_seq` is the one re-ask counter.** `check_risk_system_pg` reads it as a required
+  read, and every survey page — not just a multi-page survey's final page — bumps it by one, so
+  **every page submission re-asks RS**, even a page whose own findings are first-time data.
+  `seed_scoring_checkpoint_pg` seeds it to `0` once both intake checks pass, which also triggers the
+  first call (with `checkrisksystem.intakeGate` requiring both checks `true`). Every other read is a
+  rollback trigger too, so a later *change* to data RS already saw re-asks it on its own. See
+  [What re-asks Risk System](#what-re-asks-risk-system) for why a counter is needed at all.
+- There is **no `stage_token`** and no per-stage gate table any more: survey completion and
+  underwriting eligibility are read straight off collected data (below). The `stage_token` schema
+  field still exists (backward compatible) but nothing reads or writes it.
 - The verdict's `required_data_set` maps onto a `survey_type` via a small table
   (`checkrisksystemverdict.surveyTypeByDataSet`). Only three values are valid today: `underwriting-v1`
   → `underwriting`, `survey-normal-v1` → `normal`, `survey-high-risk-v1` → `high_risk`. The earlier
@@ -27,12 +31,13 @@ This playground implements the current shape of the Risk System integration:
   retired `FINAL_REVIEW` value are all rejected as independently selectable survey types and now fail
   safe like any other unrecognised value — they're only reachable as pages inside `normal`/`high_risk`.
 - `underwriting` (`required_data_set=underwriting-v1`) is gated beyond the ordinary mapping: it's only
-  reachable for a document that completed the `high_risk` survey (`stage_token ==
-  "complete_high_risk_survey"`) **and** whose `process.loan_structure.product_type` is `NDF4W` — never
-  from `normal`, never for `NDF2W` (`survey.IsUnderwritingEligible`). `product_type` is part of what
-  LPW's (simulated) call to RS includes (`checkrisksystem.requiredReadSet`), so a correctly-behaving
-  RS should never request `underwriting-v1` outside that condition — but if it does anyway (bug, or a
-  deliberately inconsistent test verdict, see TC4), `check_risk_system_pg_verdict` refuses to write
+  reachable for a document that completed the `high_risk` survey (`process.environment_check.result`
+  is present — only `high_risk`'s final page writes it) **and** whose
+  `process.loan_structure.product_type` is `NDF4W` — never from `normal`, never for `NDF2W`
+  (`survey.IsUnderwritingEligible`). `product_type` is part of what LPW's (simulated) call to RS
+  includes (`checkrisksystem.requiredReadSet`), so a correctly-behaving RS should never request
+  `underwriting-v1` outside that condition — but if it does anyway (bug, or a deliberately
+  inconsistent test verdict, see TC4), `check_risk_system_pg_verdict` refuses to write
   `survey_type=underwriting` and returns an error instead, which Temporal retries indefinitely,
   surfacing as a visibly stuck/failing activity rather than a silent stall or an automatic loan
   rejection.
@@ -40,14 +45,14 @@ This playground implements the current shape of the Risk System integration:
   partial completion (`WorkerTaskCompletionData.Action == "partial"`) that leaves the task open and
   mints a fresh task id for the next page; only the final page closes it. `normal` spans 4 pages
   (identity, asset, financing, income); `high_risk` spans 5 (the same identity/asset/financing pages
-  plus its own income page, plus a final `environment_check` page). The first three pages are
-  collected identically (same page name, same `stage_token`) by both outcomes — this is what lets
-  Risk System escalate a document from `normal` to `high_risk` mid-flow without re-collecting pages
-  already submitted. See `tasking/survey.standardSurveyPages`.
+  plus its own income page, plus a final `environment_check` page). Whether a survey type is done is
+  read straight off collected data — its final page's field (`income.verified_amount` for `normal`,
+  `environment_check.result` for `high_risk`, `underwriting.confirmed` for `underwriting`). The first
+  three pages are collected identically by both outcomes — this is what lets Risk System escalate a
+  document from `normal` to `high_risk` mid-flow without re-collecting pages already submitted. See
+  `tasking/survey.standardSurveyPages`.
 - `calculate_risk_funding_pg` consumes the verdict's max LTV and caps the submitted LTV once
   financing data exists.
-- `seed_scoring_checkpoint_pg` pre-seeds the cursor at `post_submission` once both intake checks
-  pass, so the first Risk System call happens **before any survey runs**.
 
 The upstream RS call is intentionally a local stub. The trigger records a request id
 (`playground-rs-<uuid>`) so the planner and lock behavior can be exercised without an LGS proxy
@@ -64,10 +69,10 @@ Before any of the above runs, three ordinary (non-async) activities gate entry i
 3. `check_duplicate_license_plate_pg` — rejects a `process.asset.license_plate` already on an open
    application; writes `process.duplicate_plate_check_passed`.
 
-Once both checks pass, `seed_scoring_checkpoint_pg` seeds `trigger_seq=0` / `stage_token=post_submission`
-— and never again (`shouldSeed` refuses once `trigger_seq` already exists; see
-`TestShouldSeedNeverReseeds`). `check_risk_system_pg` then fires immediately for `post_submission`,
-since that checkpoint's gate is empty.
+Once both checks pass, `seed_scoring_checkpoint_pg` seeds `trigger_seq=0` — and never again
+(`shouldSeed` refuses once `trigger_seq` already exists; see `TestShouldSeedNeverReseeds`).
+`check_risk_system_pg` then fires immediately (`checkrisksystem.intakeGate` requires both flags
+present **and** `true`) — **before any survey runs**.
 
 ## Required data set selects the survey type
 
@@ -79,7 +84,7 @@ onto a survey type via a small declarative table (`checkrisksystemverdict.survey
 
 | `required_data_set` | `survey_type` | outcome |
 |---|---|---|
-| `underwriting-v1` | `underwriting` | single-page survey confirming `process.underwriting.confirmed` — only reachable from the `high_risk` path (`stage_token == complete_high_risk_survey`) for the `NDF4W` product; `normal` and `NDF2W` applicants terminate at their own path's completion verdict instead (see TC1, TC4) |
+| `underwriting-v1` | `underwriting` | single-page survey confirming `process.underwriting.confirmed` — only eligible once the `high_risk` survey is complete (`environment_check.result` present) for the `NDF4W` product; never from `normal`, never for `NDF2W` (see TC2, TC4) |
 | `survey-normal-v1` | `normal` | 4-page survey: identity → asset → financing → income |
 | `survey-high-risk-v1` | `high_risk` | 5-page survey: identity → asset → financing → income → environment_check |
 
@@ -89,38 +94,49 @@ onto a survey type via a small declarative table (`checkrisksystemverdict.survey
 
 ### The multi-page survey outcomes
 
-`normal` and `high_risk` are the only two ways a document reaches any of the checkpoints below
+`normal` and `high_risk` are the only two ways a document reaches the survey pages below
 `underwriting` — the single-page granular survey types (`identity`/`asset`/`financing`/`income`) that
 used to be independently selectable no longer exist as entries in `surveyOutcomesByType`.
 
-Every page's task completion writes that page's own findings **plus** `trigger_seq` (incremented)
-and `stage_token` (that page's checkpoint) — see `survey.SurveyPageCompletion`. Since those two
-fields are `check_risk_system_pg`'s required reads, submitting *any* page re-arms it, not just the
-last one; a verdict must follow every page to keep a multi-page survey moving, holding a write lock
-on `survey_type` until it's delivered.
+Each page's task completion writes that page's own findings **plus** `trigger_seq` (previous + 1) —
+see `survey.SurveyPageCompletion`.
 
-| checkpoint (`stage_token`) | reached after | gate field |
-|---|---|---|
-| `post_submission` | seeding | none — fires immediately |
-| `customer_verification` | page 1 (`identity`) of `normal`/`high_risk` | `customer.birth_date` |
-| `asset_review` | page 2 (`asset`) of `normal`/`high_risk` | `process.asset.condition` |
-| `financing_confirmation` | page 3 (`financing`) of `normal`/`high_risk` | `process.loan_structure.ltv_submission` |
-| `complete_normal_survey` | page 4/final (`income`) of `normal` | `process.income.verified_amount` |
-| `income_confirmation` | page 4 (`income`) of `high_risk` (non-final) | `process.income.verified_amount` |
-| `complete_high_risk_survey` | page 5/final (`environment_check`) of `high_risk` | `process.environment_check.result` |
-| `underwriting` | the single-page `underwriting` survey (`high_risk` + `NDF4W` only) | `process.underwriting.confirmed` |
+### What re-asks Risk System
 
-(`checkrisksystem.stageGates` also still defines a bare `financing` entry gated on
-`ltv_submission` — a holdover from before `financing_confirmation` existed. No current survey
-outcome advances `stage_token` to `financing` any more, so it isn't reachable through `normal` or
-`high_risk` today.)
+`check_risk_system_pg` is asked once when intake passes (after the seed), then **after every survey
+page**, because every page bumps `trigger_seq`. While it's pending it holds a read lock on
+`trigger_seq`, which is in the survey's write set, so the survey can't open its next page until the
+verdict lands (`FieldLock.CanSetWrite`). A verdict must follow every page to keep a multi-page survey
+moving.
 
-Because `identity`/`asset`/`financing` share the same page name and `stage_token` between `normal`
-and `high_risk` (`survey.standardSurveyPages`), Risk System can escalate a document from `normal` to
-`high_risk` on **any** verdict, including one sent mid-survey: `shouldCreateTask` only compares the
-*current* `survey_type`'s `nextStage` against the *current* `stage_token`, so an already-satisfied
-shared checkpoint is simply never re-asked, and the task stays open to collect whatever the new
-outcome still needs (`TestShouldCreateTaskContinuesAcrossSurveyTypeEscalation`,
+#### Why a counter is needed
+
+This is SDK behaviour, not a playground choice. A step that has already run is put back on the
+planner's run list only by `planner.Rollback` (or, for a task, by its own partial completion), and
+`Rollback` is invoked only for fields in `DocSetResult.Updated` — a field that already had a value
+and got a different one (`runtime/workflow.go` completion handling, `versioned_value.go`'s `Set`).
+A first-time write lands in `NewlySet` instead, which `Rollback` never uses as a trigger. Most survey
+pages only set data for the first time (`asset.condition`, `income.verified_amount`,
+`environment_check.result`, `underwriting.confirmed`), so without a counter they would never re-ask
+RS. `trigger_seq` is seeded to `0` precisely so page 1's write is already an update. `data-set` and
+`data-forward`/`data-forward-override` workflow updates never call `Rollback` at all, so they can't
+re-ask RS either — only activity/task completions can. The alternatives that were weighed (and why an
+SDK "re-arm on first set" flag was rejected — it breaks planner convergence) are recorded in
+[RISK_SYSTEM_RETRIGGER_OPTIONS.md](RISK_SYSTEM_RETRIGGER_OPTIONS.md).
+
+The same rule applies downstream, with one more wrinkle: `calculate_risk_funding_pg` recomputes when
+something it reads is *updated* — including through a later page's `trigger_seq` bump, via the
+rollback impact walk — but **not after a terminal verdict**: the SDK skips rollback once the planner
+is terminating. A cap RS sends or changes on the terminal (approve/reject) verdict itself is recorded
+but never applied, so send it on an earlier, non-terminal verdict (TC1 sends it on the page-3
+verdict).
+
+Because `identity`/`asset`/`financing` are the same pages between `normal` and `high_risk`
+(`survey.standardSurveyPages`), Risk System can escalate a document from `normal` to `high_risk` on
+**any** verdict, including one sent mid-survey: `shouldCreateTask` only checks whether the *current*
+`survey_type`'s completion field is present, so pages already collected simply stay collected, and
+the task stays open to collect whatever the new outcome still needs
+(`TestShouldCreateTaskContinuesAcrossSurveyTypeEscalation`,
 `TestNormalAndHighRiskSharePagesBeforeDiverging`; TC3 below exercises this end to end).
 
 An unrecognised `required_data_set` fails safe rather than guessing a survey type. This matters
@@ -136,8 +152,8 @@ that activity (and Temporal retries it) rather than being cleanly refused.
 
 The `underwriting-v1` eligibility check (`survey.IsUnderwritingEligible`) is a second, distinct
 fail-safe layered on top of the mapping table above: even a *recognised* `required_data_set` value can
-still be rejected if the document's own state (`stage_token`, `product_type`) doesn't back it up. See
-TC4.
+still be rejected if the document's own state (`environment_check.result`, `product_type`) doesn't
+back it up. See TC4.
 
 ## Local flow
 
@@ -175,37 +191,33 @@ TC4.
    it from the workflow ID automatically at workflow start.
 5. `check_submission_pg` → `check_customer_eligibility_pg` → `check_duplicate_license_plate_pg` run
    as before.
-6. `seed_scoring_checkpoint_pg` pre-seeds `trigger_seq=0`, `stage_token=post_submission` once both
-   checks pass — **before any survey has run**.
-7. `check_risk_system_pg` fires immediately for `post_submission` (its gate has no required fields).
-8. Complete that pending activity with a verdict: `status=pending`,
+6. `seed_scoring_checkpoint_pg` seeds `trigger_seq=0` once both checks pass — **before any survey
+   has run** — and `check_risk_system_pg` fires straight after.
+7. Complete that pending activity with a verdict: `status=pending`,
    `required_data_set=survey-normal-v1`. `cmd/testcli verdict -id <id> -dataset survey-normal-v1` is
    the supported way to do this by hand — it discovers the pending activity's id and validates the
    payload first.
-9. `check_risk_system_pg`'s async handler maps that onto `survey_type=normal`; the `SURVEY` task
-   opens, spanning 4 pages.
-10. Page 1 (`identity`) — partial completion: `customer.birth_date`, `customer.name`, plus
-    `trigger_seq=1`/`stage_token=customer_verification`. The task stays open and mints a fresh task
-    id for page 2; the cursor advance re-arms `check_risk_system_pg`.
-11. Verdict for the re-armed trigger (`survey-normal-v1` again) completes it and keeps the normal
-    survey going. Repeat for page 2 (`asset` → `asset_review`) and page 3 (`financing` →
-    `financing_confirmation`).
-12. Page 4 (`income`) is the **final** page: it closes the task and advances the cursor to
-    `complete_normal_survey`.
-13. Verdict for `complete_normal_survey`: `status=approved`, `required_data_set=survey-normal-v1`,
-    `max_ltv=0.6` — this is the verdict that actually caps the loan. `calculate_risk_funding_pg`
-    fires and computes `effective_ltv=0.6`, `max_funding=60000` (same numbers as
-    `TestCalculateFundingCapsSubmissionLTVAtRiskSystemMax`). The `normal` path terminates right here:
-    it repeats `required_data_set=survey-normal-v1` rather than requesting `underwriting-v1`, since
-    `underwriting` is reachable only from the `high_risk` path
-    (`survey.IsUnderwritingEligible`) — `check_risk_system_pg_verdict` writes the terminal status and
-    the workflow stops. There is no step 14 for the `normal` path.
+8. `check_risk_system_pg_verdict` maps that onto `survey_type=normal`; the `SURVEY` task opens,
+   spanning 4 pages.
+9. Page 1 (`identity`) — partial completion: `customer.birth_date`, `customer.name`, plus
+   `trigger_seq=1`. The task stays open and mints a fresh task id for page 2; the `trigger_seq` bump
+   re-asks RS. Verdict `survey-normal-v1` again keeps the survey going.
+10. Repeat for page 2 (`asset`, `trigger_seq=2`) — RS is re-asked even though `asset.condition` is
+    first-time data — and page 3 (`financing`, `trigger_seq=3`). Send the page-3 verdict with
+    `max_ltv=0.6`: RS's lending cap.
+11. Page 4 (`income`, `trigger_seq=4`) is the **final** page: it closes the task. Its bump re-runs
+    `calculate_risk_funding_pg` under the cap — `effective_ltv=0.6`, `max_funding=60000` (same numbers
+    as `TestCalculateFundingCapsSubmissionLTVAtRiskSystemMax`) — and re-asks RS.
+12. Verdict `status=approved`, `required_data_set=survey-normal-v1`, `max_ltv=0.6`. The `normal` path
+    terminates right here: it repeats `survey-normal-v1` rather than requesting `underwriting-v1`,
+    since `underwriting` is reachable only from the `high_risk` path (`survey.IsUnderwritingEligible`)
+    — `check_risk_system_pg_verdict` writes the terminal status and the workflow stops.
 
 This is exactly `testcli tc tc1`; `tc2` runs the same shape but on `high_risk` from the first verdict
-and continues on into the single-page `underwriting` survey (see TC2 below); `tc3` starts on `normal`
-and gets escalated to `high_risk` mid-flow, also reaching `underwriting`; `tc4` proves the
-underwriting gate rejects an `NDF2W` applicant even after completing the `high_risk` survey — see the
-test cases below.
+and continues on into the single-page `underwriting` survey; `tc3` starts on `normal` and gets
+escalated to `high_risk` mid-flow, also reaching `underwriting`; `tc4` proves the underwriting gate
+rejects an `NDF2W` applicant even after completing the `high_risk` survey; `tc5`/`tc6` prove rejection
+is terminal — see the test cases below.
 
 ## Test cases
 
@@ -233,10 +245,9 @@ via the Temporal UI or the ArangoDB document.
 go run ./cmd/testcli start    -id poc-lead-0001
 go run ./cmd/testcli inject   -id poc-lead-0001
 go run ./cmd/testcli verdict  -id poc-lead-0001 -dataset survey-normal-v1
-go run ./cmd/testcli complete-survey -id poc-lead-0001 -type normal -outcome partial \
-  -field '$.customer.birth_date=1985-03-15' -field '$.customer.name=Jane Smith' \
-  -field '$.process.scoring.trigger_seq=1' -field '$.process.scoring.stage_token=customer_verification'
-go run ./cmd/testcli verdict -id poc-lead-0001 -dataset underwriting-v1 -max-ltv 0.6
+go run ./cmd/testcli complete-survey -id poc-lead-0001 -type normal -outcome partial -seq 1 \
+  -field '$.customer.birth_date=1985-03-15' -field '$.customer.name=Jane Smith'
+go run ./cmd/testcli verdict -id poc-lead-0001 -dataset survey-normal-v1
 go run ./cmd/testcli override -id poc-lead-0001 -field '$.process.loan_structure.ltv_submission=0.5'
 ```
 
@@ -245,33 +256,39 @@ handler — every worker gets it for free); it sends the default identity + asse
 fields unless `-bare` is given, plus any `-field path=value` overrides (repeatable) — `value` is
 parsed as a number, then a bool, then falls back to a string. `override` uses this worker's own
 `data-forward-override` handler to overwrite a field that's *already* set (`data-set` refuses that
-outright).
+outright). Neither update re-asks Risk System, even when it changes a value
+`check_risk_system_pg` reads — workflow updates never call `planner.Rollback` (see
+[Why a counter is needed](#why-a-counter-is-needed)).
 
 `verdict` completes the pending `check_risk_system_pg` activity directly
 (`client.CompleteActivityByID`) after validating `-status` (`pending|approved|rejected` — default
 `pending`) and `-dataset` (`underwriting-v1|survey-normal-v1|survey-high-risk-v1`) client-side; it
-fails outright if Risk System was never asked about the current stage (no pending activity to
-complete). Completing it only makes `check_risk_system_pg` record the raw verdict — a separate
+fails outright if Risk System was not (re-)asked (no pending activity to complete — e.g. a page
+submitted without bumping `trigger_seq`). Completing it only makes `check_risk_system_pg` record the
+raw verdict — a separate
 `check_risk_system_pg_verdict` activity then interprets it, and for `underwriting-v1` may itself fail
 (and retry) if the document isn't actually eligible; see TC4.
 
 `complete-survey` simulates a human submitting one page of the open `SURVEY` task via `-type
 underwriting|normal|high_risk`. **It does not enforce page order** — `tasksim`'s handler tracks only
 "is there a pending task", not which page it's on — so `-outcome final -seq N` sends
-`survey.SurveyOutcomeFields`' canned *last*-page fields (plus the cursor) and closes the task
+`survey.SurveyOutcomeFields`' canned *last*-page fields (plus `trigger_seq=N`) and closes the task
 immediately, which is convenient for skipping straight to the end of a multi-page outcome but will
 leave the earlier pages' fields unset unless you provided them another way (e.g. `inject`/`override`,
-or the `-field` overrides shown above). `-outcome partial` sends only `-field` overrides, with no
-cursor fields added automatically — reproducing exactly what an automated `tc` scenario's
-`surveyPageStep` does for one page means including `trigger_seq`/`stage_token` in `-field` yourself,
-as in the example above. `describe -id <id>` prints the workflow's pending activities (and any
-failure on them) — useful for confirming a step settled.
+or the `-field` overrides shown above). `-outcome partial -seq N` sends the `-field` overrides plus
+`trigger_seq=N` — reproducing exactly what an automated `tc` scenario's `surveyPageStep` does for one
+page means passing that page's fields, as in the example above. **`-seq` must be the previous value +
+1** (seeded `0`, so the Nth page submitted writes `N`): re-sending the same value is not an update, so
+RS is not re-asked and the next `verdict` fails. `describe -id <id>` prints the workflow's pending
+activities (and any failure on them) — useful for confirming a step settled.
 
 Note on "the workflow stops" below: that means the *planner* stops scheduling activities once
-`$.status` reaches a terminal value (`doc.SetTermination`) — `describe` will keep reporting
-`status=Running` indefinitely, since the underlying Temporal workflow execution is designed to stay
-open for the life of the document, not to close itself. `pendingActivities=0` is what confirms
-nothing more will run.
+`$.status` reaches a terminal value (`doc.SetTermination`). With nothing left pending, the Temporal
+execution then closes (`describe` reports `status=Completed`, as TC1–TC3, TC5 and TC6 do). If a
+document were terminated while a survey task was still open or queued, it would instead stay
+`status=Running` with a pending `termination-activity`, because `tasksim` never answers early task
+termination (`TerminationNotification` is a no-op) — none of the scripted scenarios do that. A
+document stuck non-terminal (TC4) stays `Running`.
 
 ### Doing it by hand with the `temporal` CLI
 
@@ -362,56 +379,51 @@ has one, and it only exposes pending task ids), so inspect document state with `
 ### TC1 — `survey-normal-v1` runs a 4-page multi-page survey to approval
 
 Proves the `required_data_set=survey-normal-v1` mapping end to end: a single `SURVEY` task spans four
-pages, each page a partial completion (except the last), every page's cursor advance re-arms
+pages, each page a partial completion (except the last), every page's `trigger_seq` bump re-asks
 `check_risk_system_pg`, and the LTV cap still applies.
 
 1. Start the workflow and inject, as above.
-2. Verdict for `post_submission`: `status=pending`, `required_data_set=survey-normal-v1`,
-   `max_ltv=0`. → `survey_type=normal` → one `SURVEY` task opens, spanning four pages.
+2. Verdict (intake passed): `status=pending`, `required_data_set=survey-normal-v1`, `max_ltv=0`. →
+   `survey_type=normal` → one `SURVEY` task opens, spanning four pages.
 3. Page 1 (`identity`) — partial: `customer.birth_date=1985-03-15`, `customer.name=Jane Smith`,
-   `trigger_seq=1`, `stage_token=customer_verification`. Task stays open, mints a fresh task id for
-   page 2. This re-arms `check_risk_system_pg`; a `survey-normal-v1` verdict completes it and keeps
-   the survey going.
-4. Page 2 (`asset`) — partial: `asset.condition=fair`, `trigger_seq=2`, `stage_token=asset_review`.
-   Same re-arm/verdict cycle.
+   `trigger_seq=1`. Task stays open, mints a fresh task id for page 2. The bump re-asks RS; a
+   `survey-normal-v1` verdict keeps the survey going.
+4. Page 2 (`asset`) — partial: `asset.condition=fair`, `trigger_seq=2`. Same re-ask/verdict cycle —
+   the bump re-asks RS even though `asset.condition` is first-time data.
 5. Page 3 (`financing`) — partial: `loan_structure.provisional_amount=100000`,
-   `loan_structure.ltv_submission=0.8`, `trigger_seq=3`, `stage_token=financing_confirmation`. Same
-   re-arm/verdict cycle.
-6. Page 4 (`income`) — **final**: `income.verified_amount=15000000`, `trigger_seq=4`,
-   `stage_token=complete_normal_survey`. The task closes.
-7. Verdict for `complete_normal_survey`: `status=approved`, `required_data_set=survey-normal-v1`,
-   `max_ltv=0.6` — `calculate_risk_funding_pg` fires and computes `effective_ltv=0.6`,
-   `max_funding=60000` (matches `TestCalculateFundingCapsSubmissionLTVAtRiskSystemMax`). The `normal`
-   path terminates directly here rather than requesting `underwriting-v1`, since `underwriting` is
+   `loan_structure.ltv_submission=0.8`, `trigger_seq=3`. Verdict `survey-normal-v1`, `max_ltv=0.6`
+   sets RS's lending cap.
+6. Page 4 (`income`) — **final**: `income.verified_amount=15000000`, `trigger_seq=4`. The task
+   closes; the bump re-runs `calculate_risk_funding_pg` under the cap (`effective_ltv=0.6`,
+   `max_funding=60000`, matching `TestCalculateFundingCapsSubmissionLTVAtRiskSystemMax`) and re-asks
+   RS.
+7. Verdict: `status=approved`, `required_data_set=survey-normal-v1`, `max_ltv=0.6`. The `normal` path
+   terminates directly here rather than requesting `underwriting-v1`, since `underwriting` is
    reachable only from the `high_risk` path (`survey.IsUnderwritingEligible`) — see TC2/TC3/TC4 for
    that path. → `status=approved`, `status_timestamps.approved` and `status_timestamps.terminal` set,
-   `loan_structure.max_funding=60000`. The workflow stops; no further activity runs.
+   `loan_structure.max_funding=60000`. The workflow stops (`status=Completed`).
 
 ### TC2 — `survey-high-risk-v1` runs a 5-page multi-page survey from the start
 
-Proves the `required_data_set=survey-high-risk-v1` mapping: `normal`'s four shared pages plus a
-fifth, final `environment_check` page, selected from the very first verdict, followed all the way
-through to the single-page `underwriting` survey.
+Proves the `required_data_set=survey-high-risk-v1` mapping: `normal`'s shared pages plus its own
+income page and a fifth, final `environment_check` page, selected from the very first verdict,
+followed all the way through to the single-page `underwriting` survey.
 
 1. Start the workflow and inject, as above (`product_type=NDF4W`, the default).
-2. Verdict for `post_submission`: `status=pending`, `required_data_set=survey-high-risk-v1`,
-   `max_ltv=0` — Risk System flags this applicant high risk immediately. →
-   `survey_type=high_risk` → one `SURVEY` task opens, spanning five pages.
-3. Pages 1–3 (`identity` → `customer_verification`, `asset` → `asset_review`, `financing` →
-   `financing_confirmation`) run exactly as in TC1 — these three pages are collected identically by
-   `normal` and `high_risk` (`standardSurveyPages`) — each partial completion re-arming
-   `check_risk_system_pg`, each followed by a `survey-high-risk-v1` verdict.
-4. Page 4 (`income`) — partial (not final, unlike `normal`): `income.verified_amount=15000000`,
-   `trigger_seq=4`, `stage_token=income_confirmation`. Task stays open for the fifth page.
-5. Page 5 (`environment_check`) — **final**: `environment_check.result=good`, `trigger_seq=5`,
-   `stage_token=complete_high_risk_survey`. The task closes.
-6. Verdict for `complete_high_risk_survey`: `status=pending`, `required_data_set=underwriting-v1`,
-   `max_ltv=0.6` — same LTV cap as TC1: `effective_ltv=0.6`, `max_funding=60000`.
-   `check_risk_system_pg_verdict` checks `survey.IsUnderwritingEligible("complete_high_risk_survey",
-   "NDF4W")` — both conditions hold, so it writes `survey_type=underwriting`. →
-   the single-page `underwriting` survey opens.
-7. Complete it: `underwriting.confirmed=true`, `trigger_seq=6`, `stage_token=underwriting`.
-8. Verdict for `underwriting`: `status=approved`, `required_data_set=underwriting-v1`, `max_ltv=0.6`. →
+2. Verdict (intake passed): `status=pending`, `required_data_set=survey-high-risk-v1`, `max_ltv=0` —
+   Risk System flags this applicant high risk immediately. → `survey_type=high_risk` → one `SURVEY`
+   task opens, spanning five pages.
+3. Pages 1–4 (`identity`, `asset`, `financing`, `income` — the fourth non-final for `high_risk`),
+   `trigger_seq=1..4`, each followed by a `survey-high-risk-v1` verdict.
+4. Page 5 (`environment_check`) — **final**: `environment_check.result=good`, `trigger_seq=5`. The
+   task closes.
+5. Verdict: `status=pending`, `required_data_set=underwriting-v1`, `max_ltv=0.6`.
+   `check_risk_system_pg_verdict` checks `survey.IsUnderwritingEligible` — `environment_check.result`
+   is present and the product is `NDF4W`, so it writes `survey_type=underwriting`. → the single-page
+   `underwriting` survey opens.
+6. Complete it: `underwriting.confirmed=true`, `trigger_seq=6`. The bump re-runs the funding
+   calculation under the cap (`max_funding=60000`) and re-asks RS.
+7. Verdict: `status=approved`, `required_data_set=underwriting-v1`, `max_ltv=0.6`. →
    `status=approved`, terminal timestamps set, `loan_structure.max_funding=60000`. The workflow stops.
 
 ### TC3 — Risk System escalates a document from `normal` to `high_risk` mid-flow
@@ -423,28 +435,23 @@ Proves the design property behind sharing pages between the two outcomes
 submitted, and still reaches `underwriting` once the (now `high_risk`) survey completes.
 
 1. Start the workflow and inject, as above (`product_type=NDF4W`, the default).
-2. Verdict for `post_submission`: `status=pending`, `required_data_set=survey-normal-v1`,
-   `max_ltv=0` — starts as a standard applicant. → `survey_type=normal`.
-3. Page 1 (`identity`) — partial, `trigger_seq=1`, `stage_token=customer_verification`. Verdict for
-   `survey-normal-v1` keeps it going.
-4. Page 2 (`asset`) — partial, `asset.condition=fair`, `trigger_seq=2`, `stage_token=asset_review`.
+2. Verdict (intake passed): `status=pending`, `required_data_set=survey-normal-v1` — starts as a
+   standard applicant. → `survey_type=normal`.
+3. Page 1 (`identity`, `trigger_seq=1`) — verdict `survey-normal-v1` keeps it going.
+4. Page 2 (`asset`, `asset.condition=fair`, `trigger_seq=2`).
 5. Instead of another `survey-normal-v1` verdict, Risk System's asset-condition read comes back bad:
-   send a verdict with `required_data_set=survey-high-risk-v1`. `survey_type` flips to `high_risk`
-   while `stage_token` is still `asset_review`. Because `identity`/`asset`/`financing` are the same
-   pages (same name, same `stage_token`) under both outcomes, `shouldCreateTask` sees `stage_token`
-   (`asset_review`) is not `high_risk`'s `nextStage` (`complete_high_risk_survey`) and keeps the task
-   open — pages 1–2 are **not** re-submitted. The task continues at `high_risk`'s page 3.
-6. Page 3 (`financing`) — partial, `trigger_seq=3`, `stage_token=financing_confirmation`. Verdict for
-   `survey-high-risk-v1` keeps it going.
-7. Page 4 (`income`) — partial, `trigger_seq=4`, `stage_token=income_confirmation`. Verdict for
-   `survey-high-risk-v1` keeps it going.
-8. Page 5 (`environment_check`) — **final**, `trigger_seq=5`, `stage_token=complete_high_risk_survey`.
-9. Verdict for `complete_high_risk_survey`: `status=pending`, `required_data_set=underwriting-v1`,
-   `max_ltv=0.6` — `effective_ltv=0.6`, `max_funding=60000`. This document did start on `normal`, but
-   by the time this verdict lands `stage_token=complete_high_risk_survey` (it escalated at step 5), so
-   `survey.IsUnderwritingEligible` still holds → `survey_type=underwriting`.
-10. Complete it: `trigger_seq=6`, `stage_token=underwriting`.
-11. Verdict for `underwriting`: `status=approved`. → `status=approved`, terminal timestamps set,
+   send a verdict with `required_data_set=survey-high-risk-v1`. `survey_type` flips to `high_risk`;
+   `shouldCreateTask` sees `high_risk`'s completion field (`environment_check.result`) is still
+   absent and keeps the task open — pages 1–2 are **not** re-submitted. The task continues at
+   `high_risk`'s page 3.
+6. Pages 3–4 (`financing`, `income`; `trigger_seq=3..4`), each followed by a `survey-high-risk-v1`
+   verdict.
+7. Page 5 (`environment_check`) — **final**, `trigger_seq=5`.
+8. Verdict: `status=pending`, `required_data_set=underwriting-v1`, `max_ltv=0.6` — the document did
+   start on `normal`, but it has now completed `high_risk` (`environment_check.result` present), so
+   `survey.IsUnderwritingEligible` holds → `survey_type=underwriting`.
+9. Complete it: `trigger_seq=6`.
+10. Verdict: `status=approved`. → `status=approved`, terminal timestamps set,
     `loan_structure.max_funding=60000`. The workflow stops.
 
 ### TC4 — the underwriting gate rejects an `NDF2W` applicant even via the `high_risk` path
@@ -456,24 +463,24 @@ that refusal is a visible, retrying activity failure, not a silent stall or an a
 1. Start the workflow and inject **with `product_type=NDF2W`** (`testcli`'s
    `injectIdentityStepWithProductType("NDF2W")` — `product_type` is `mutable:false`, so this must be
    set at the very first `data-set`, not overridden later).
-2. Verdict for `post_submission`: `status=pending`, `required_data_set=survey-high-risk-v1`,
-   `max_ltv=0`. → `survey_type=high_risk`.
-3. Pages 1–5 run exactly as in TC2, ending with `stage_token=complete_high_risk_survey`.
-4. Verdict for `complete_high_risk_survey`: `status=pending`, `required_data_set=underwriting-v1`,
-   `max_ltv=0.6`. `check_risk_system_pg` records this raw verdict without any validation — that
-   succeeds. `check_risk_system_pg_verdict` then runs `survey.IsUnderwritingEligible(
-   "complete_high_risk_survey", "NDF2W")`, which is `false` (the path is right, the product isn't), so
-   it returns an error instead of writing `survey_type=underwriting`. Temporal retries that activity
-   indefinitely per its default retry policy.
+2. Verdict (intake passed): `status=pending`, `required_data_set=survey-high-risk-v1`. →
+   `survey_type=high_risk`.
+3. Pages 1–5 run exactly as in TC2 (`trigger_seq=1..5`), ending with `environment_check.result`
+   present.
+4. Verdict: `status=pending`, `required_data_set=underwriting-v1`, `max_ltv=0.6`.
+   `check_risk_system_pg` records this raw verdict without any validation — that succeeds.
+   `check_risk_system_pg_verdict` then runs `survey.IsUnderwritingEligible`, which is `false` (the
+   path is right, the product isn't), so it returns an error instead of writing
+   `survey_type=underwriting`. Temporal retries that activity indefinitely per its default retry
+   policy.
 5. `testcli describe -id <id>` (or the Temporal UI) now shows a pending, repeatedly-failing
    `check_risk_system_pg_verdict` activity for this workflow — not a clean stop, and not
    `pendingActivities=0`.
-6. Attempting `complete-survey -type underwriting` fails: `survey_type` never became `"underwriting"`,
-   so no `SURVEY` task for it was ever created — there is nothing to complete.
-7. The document stays at `status=processing` indefinitely, with `survey_type` still `high_risk` and
-   `stage_token` still `complete_high_risk_survey` (confirm via the ArangoDB document) — this is the
-   intended outcome for a genuine Risk-System/LORA disagreement: visible and diagnosable, not silently
-   stuck and not an unearned rejection of the applicant.
+6. Attempting `complete-survey -type underwriting` fails: `survey_type` never became
+   `"underwriting"`, so no `SURVEY` task for it was ever created — there is nothing to complete.
+7. The document stays at `status=processing` indefinitely, with `survey_type` still `high_risk` —
+   this is the intended outcome for a genuine Risk-System/LORA disagreement: visible and
+   diagnosable, not silently stuck and not an unearned rejection of the applicant.
 
 ### TC5 — Risk System rejects the applicant immediately, before any survey runs
 
@@ -484,7 +491,7 @@ unchanged: `document.IsTerminalStatus`/`doc.SetTermination` stop the planner the
 chance to open.
 
 1. Start the workflow and inject, as above.
-2. Verdict for `post_submission`: `status=rejected`, `required_data_set=survey-normal-v1`, `max_ltv=0`,
+2. Verdict (intake passed): `status=rejected`, `required_data_set=survey-normal-v1`, `max_ltv=0`,
    `reject_reason="provisional amount exceeds applicant's income capacity"`. `check_risk_system_pg`
    records this verbatim; `check_risk_system_pg_verdict` maps `survey-normal-v1` → `survey_type=normal`
    and `rejected` → `$.status=rejected` in the same write, then sets `status_timestamps.rejected` and
@@ -501,17 +508,16 @@ Proves the same terminal property as TC5 but reached the long way round — afte
 `normal` survey cycle identical to TC1's, so a rejection is exactly as reachable from the end of a
 survey as it is up front, not a special early-exit path.
 
-1. Steps 1–6 run exactly as TC1's steps 1–6: inject, verdict `post_submission` →
-   `survey-normal-v1`/`status=pending`, then pages 1–4 (`identity`/`asset`/`financing`/`income`) each
-   followed by a `survey-normal-v1`/`status=pending` verdict that keeps the survey going. Page 4 is
-   final and closes the task, advancing `stage_token` to `complete_normal_survey`.
-2. Verdict for `complete_normal_survey`: `status=rejected` (instead of TC1's `approved`),
+1. Steps 1–6 run exactly as TC1's steps 1–6, except no cap: inject, verdict `survey-normal-v1`, then
+   pages 1–4 (`trigger_seq=1..4`) each followed by a `survey-normal-v1`/`status=pending` verdict.
+   Page 4 is final and closes the task.
+2. Verdict for the completed survey: `status=rejected` (instead of TC1's `approved`),
    `required_data_set=survey-normal-v1`, `max_ltv=0`,
    `reject_reason="verified income insufficient to support requested financing"`. →
    `status=rejected`, `status_reason` set from `reject_reason`, `status_timestamps.rejected` and
    `status_timestamps.terminal` set — the same terminal handling TC1's `approved` verdict gets. The
-   workflow stops exactly as TC1's does; there is no further checkpoint (this path never reaches
-   `underwriting-v1` either, same as TC1's approval).
+   survey task had already closed, so nothing is left pending and the workflow closes
+   (`status=Completed`).
 
 ---
 
@@ -528,7 +534,8 @@ covers them:
 - The seed never re-fires once progress has been made — `TestShouldSeedNeverReseeds`.
 - The funding cap never inflates the customer's own submitted LTV, only lowers it —
   `TestCalculateFundingKeepsLowerSubmissionLTV`.
-- Underwriting is unreachable outside `high_risk` + `NDF4W`, and fails safe (no task opened) rather
+- Underwriting is unreachable outside a completed `high_risk` survey + `NDF4W`, and fails safe (no
+  task opened) rather
   than assuming eligibility, on both the survey side (`TestUnderwritingRequiresHighRiskPath`,
   `TestUnderwritingRequiresNdf4wProduct`, `TestShouldCreateTaskDefendsAgainstIneligibleUnderwriting` in
   the `survey` package) and the verdict-interpretation side (`TestApplyVerdictRequiresHighRiskPath`,
@@ -537,14 +544,16 @@ covers them:
 The schema source is `lpw-playground-v0_1_1.schema.json` in `lora-schema-service`; the worker
 constants are generated from that bundled schema.
 
-The tests cover the important planner mechanics directly: required cursor paths appear in rollback
-triggers, optional payload paths do not, the checkpoint-before-survey seed fires exactly once and
-never re-seeds after progress is made, `required_data_set` maps onto a survey type (or fails safe for
-an unknown value, including the now-retired granular ones and the retired `FINAL_REVIEW`), each
-multi-page survey's pages advance the cursor to the right checkpoint one page at a time, `normal` and
-`high_risk` share their first three pages' identity so a document can escalate between them without
-re-collecting data, underwriting is gated to the `high_risk` path and the `NDF4W` product specifically
-(enforced in `check_risk_system_pg_verdict`, since `check_risk_system_pg`'s async handler has no
-document read access to do it itself), and max LTV caps the submitted LTV. The calculation's
-max-funding output is marked re-execution-neutral, following LPW's post-scoring calculator pattern for
-derived outputs.
+The tests cover the important planner mechanics directly: every read of `check_risk_system_pg`
+(required and optional) is a rollback trigger, `trigger_seq` among them and `stage_token` not read at
+all, the first call is gated on both intake checks passing, the seed fires exactly once and never
+re-seeds after progress is made, every survey page payload bumps `trigger_seq` and never writes
+`stage_token`,
+`required_data_set` maps onto a survey type (or fails safe for an unknown value, including the
+now-retired granular ones and the retired `FINAL_REVIEW`), each survey type completes on its own
+final page's field and nothing earlier, `normal` and `high_risk` share their first three pages so a
+document can escalate between them without re-collecting data, underwriting is gated to a completed
+`high_risk` survey and the `NDF4W` product specifically (enforced in `check_risk_system_pg_verdict`,
+since `check_risk_system_pg`'s async handler has no document read access to do it itself), and max
+LTV caps the submitted LTV. The calculation's max-funding output is marked re-execution-neutral,
+following LPW's post-scoring calculator pattern for derived outputs.

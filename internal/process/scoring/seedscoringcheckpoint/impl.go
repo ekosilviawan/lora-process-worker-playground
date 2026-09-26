@@ -15,18 +15,21 @@ import (
 
 const ProcessAndActivityName = "seed_scoring_checkpoint_pg"
 
-// PostSubmissionStage is the cursor value that puts the pre-survey Risk
-// System checkpoint in check_risk_system_pg's runnable set (its stage gate
-// is nil, so it fires as soon as the cursor exists).
-const PostSubmissionStage = "post_submission"
-
 // readSet is empty: whether to seed is decided entirely by the precondition
-// below (shouldSeed), not by ordinary field-presence scheduling.
+// below (shouldSeed), not by ordinary field-presence scheduling. Being empty
+// also means this step has no rollback triggers, so it can never be
+// re-impacted and rewrite the counter.
 var readSet = []common.HString{}
 
+// writeSet is just the re-ask counter. trigger_seq has to exist BEFORE the
+// first survey page: the SDK only re-arms an already-run step through
+// planner.Rollback, which only considers UPDATED fields - so page 1's
+// trigger_seq=1 re-asks Risk System only because it changes this seeded 0.
+// Without the seed, that first write would be newly-set and ignored. It is
+// also what makes check_risk_system_pg's first call wait until both intake
+// checks pass (trigger_seq is one of its required reads).
 var writeSet = []common.HString{
 	document.DocProcessScoringTriggerSeq,
-	document.DocProcessScoringStageToken,
 }
 
 type Constructor struct {
@@ -51,7 +54,6 @@ func (c *Constructor) GenerateFunction(
 	execFunc := func(_ context.Context, _ *map[common.HString]any) (*map[common.HString]any, error) {
 		return &map[common.HString]any{
 			document.DocProcessScoringTriggerSeq: 0,
-			document.DocProcessScoringStageToken: PostSubmissionStage,
 		}, nil
 	}
 
@@ -63,11 +65,11 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
 	step.SetWriteIfEqual(runtime.None, nil)
 	// Fires only once both intake checks have passed - a rejected
-	// (age or duplicate-plate) customer must never get a scoring cursor - and
-	// only once: after anyone has written the trigger sequence this must never
-	// fire again, since it always emits the same constant seed values, and
-	// re-running after survey/checkrisksystem have advanced the cursor
-	// would reset scoring progress back to post_submission.
+	// (age or duplicate-plate) customer must never get a re-ask counter, so
+	// Risk System is never asked about them - and only once: after anyone has
+	// written trigger_seq this must never fire again, since it always emits
+	// the same constant 0, and re-running after survey pages have advanced
+	// the counter would reset it.
 	step.SetPrecondition(shouldSeed, common.MakePreConditionSet(
 		[]common.HString{
 			document.DocProcessAgeCheckPassed,

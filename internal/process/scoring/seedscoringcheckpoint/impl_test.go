@@ -14,7 +14,7 @@ func TestShouldSeedFiresOnceEligible(t *testing.T) {
 		document.DocProcessDuplicatePlateCheckPassed: true,
 	}
 	if !shouldSeed(nil, data) {
-		t.Fatal("seeding must run once both intake checks have passed and the cursor does not exist yet")
+		t.Fatal("seeding must run once both intake checks have passed and trigger_seq does not exist yet")
 	}
 }
 
@@ -53,6 +53,6 @@ func TestShouldSeedNeverReseeds(t *testing.T) {
 		document.DocProcessScoringTriggerSeq:         3,
 	}
 	if shouldSeed(nil, data) {
-		t.Fatal("seeding must not re-fire once the cursor has already advanced past the seed value")
+		t.Fatal("seeding must not re-fire once trigger_seq has already advanced past the seed value")
 	}
 }

@@ -4,8 +4,8 @@
 // async handler - because checkrisksystem's asyncHandler is a
 // runtime.AsyncPayloadHandler (func(map[string]any) (map[common.HString]any,
 // error)): it only ever receives the raw external payload, never current
-// document state. The underwriting eligibility gate below needs stage_token
-// and product_type from the document, which only an ordinary activity - with
+// document state. The underwriting eligibility gate below needs
+// environment_check.result and product_type from the document, which only an ordinary activity - with
 // a normal readSet like any other Constructor in this repo - can see.
 package checkrisksystemverdict
 
@@ -32,28 +32,16 @@ var requiredReadSet = []common.HString{
 	document.DocProcessScoringRiskSystemStatus,
 }
 
-// stage_token/product_type are read here (not just in survey) because the
-// underwriting eligibility gate below must run BEFORE survey_type is ever
-// written - checkrisksystem's asyncHandler can't check them itself (see the
-// package comment), so this is the only place that can refuse to write
-// survey_type=underwriting for an ineligible applicant.
-//
-// survey_type is also read here even though this step writes it too
-// (mirroring seedscoringcheckpoint.shouldSeed's own read-your-own-writeSet
-// idempotency pattern): it's what tells applyVerdict whether a given
-// underwriting-v1 verdict is the FIRST one transitioning into underwriting
-// (gate it against stage_token/product_type) or a later one re-confirming an
-// already-accepted decision (e.g. the final approve/reject verdict Risk
-// System sends after the underwriting survey's own page closes the task -
-// that submission advances stage_token to "underwriting" itself, which would
-// otherwise wrongly fail the same gate a second time on a transition that
-// already happened).
+// environment_check.result/product_type are read here (not just in survey)
+// because the underwriting eligibility gate below must run BEFORE
+// survey_type is ever written - checkrisksystem's asyncHandler can't check
+// them itself (see the package comment), so this is the only place that can
+// refuse to write survey_type=underwriting for an ineligible applicant.
 var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocProcessScoringRiskSystemMaxLtv, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 	{Path: document.DocProcessScoringRiskSystemRejectReason, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
-	{Path: document.DocProcessScoringStageToken, Strategy: common.OptionalWaitIfLocked},
+	{Path: document.DocProcessEnvironmentCheckResult, Strategy: common.OptionalWaitIfLocked},
 	{Path: document.DocProcessLoanStructureProductType, Strategy: common.OptionalWaitIfLocked},
-	{Path: document.DocProcessScoringSurveyType, Strategy: common.OptionalWaitIfLocked},
 }
 
 var writeSet = []common.HString{
@@ -95,7 +83,7 @@ var surveyTypeByDataSet = map[string]string{
 	// maps onto a single multi-page SURVEY process (survey type "normal")
 	// rather than one granular dataset at a time. See tasking/survey, where
 	// "normal" is a multi-page outcome - each page's submission is a partial
-	// completion, only the final page advances the cursor.
+	// completion, only the final page closes the task.
 	"survey-normal-v1": "normal",
 	// survey-high-risk-v1 selects the "high_risk" survey process: RS's
 	// identifier for applicants it flags as high risk (e.g. income too low,
@@ -198,27 +186,13 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 	// failure, not a silent stall and not an automatic loan rejection (a
 	// data/integration mismatch between RS and LORA is a bug, not a reason to
 	// reject a customer's loan).
-	//
-	// currentSurveyType != "underwriting" restricts this to the TRANSITION
-	// into underwriting only. Once that transition has happened once,
-	// completing the underwriting survey's own page advances stage_token to
-	// "underwriting" itself - the next verdict Risk System sends (e.g. the
-	// final approve/reject) re-arms this step with the SAME required_data_set
-	// but a stage_token that no longer matches "complete_high_risk_survey".
-	// Re-running the gate then would wrongly reject an already-accepted
-	// decision purely because the survey it gated has since completed.
-	if surveyType == "underwriting" {
-		currentSurveyType, _ := data[document.DocProcessScoringSurveyType].(string)
-		if currentSurveyType != "underwriting" {
-			stageToken, _ := data[document.DocProcessScoringStageToken].(string)
-			productType, _ := data[document.DocProcessLoanStructureProductType].(string)
-			if !survey.IsUnderwritingEligible(stageToken, productType) {
-				return nil, fmt.Errorf(
-					"check risk system verdict: risk system requested underwriting for an ineligible applicant (stage_token=%q, product_type=%q); expected stage_token=complete_high_risk_survey and product_type=NDF4W - Risk System and LORA disagree, needs investigation",
-					stageToken, productType,
-				)
-			}
-		}
+	if surveyType == "underwriting" && !survey.IsUnderwritingEligible(data) {
+		_, highRiskCompleted := data[document.DocProcessEnvironmentCheckResult]
+		productType, _ := data[document.DocProcessLoanStructureProductType].(string)
+		return nil, fmt.Errorf(
+			"check risk system verdict: risk system requested underwriting for an ineligible applicant (high_risk survey completed=%t, product_type=%q); expected environment_check.result present and product_type=NDF4W - Risk System and LORA disagree, needs investigation",
+			highRiskCompleted, productType,
+		)
 	}
 
 	out := map[common.HString]any{
@@ -240,13 +214,12 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
 	step.SetWriteIfEqual(runtime.None, nil)
-	// This step sits in the same risk_system.*/survey_type/stage_token
-	// self-loop checkrisksystem's own SetRetainDataOnRollback comment
-	// describes: this step writes survey_type -> survey mandatorily reads it
-	// and writes stage_token -> this step optionally reads stage_token back.
-	// Without this, a later checkpoint's rollback would revert survey_type/
-	// $.status/ltv_max back to unset purely as a side effect of the next
-	// checkpoint being armed, destroying an already-applied verdict.
+	// This step sits downstream of every check_risk_system_pg re-ask (see
+	// that step's own SetRetainDataOnRollback comment): a data change that
+	// re-arms check_risk_system_pg also re-impacts this step, since it reads
+	// what that step writes. Without this, that rollback would revert
+	// survey_type/$.status/ltv_max back to unset purely as a side effect of
+	// Risk System being re-asked, destroying an already-applied verdict.
 	step.SetRetainDataOnRollback()
 	// No custom precondition: this step's requiredReadSet
 	// (risk_system.required_data_set/status) is itself the gate, matching

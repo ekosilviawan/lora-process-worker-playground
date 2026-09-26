@@ -1,6 +1,7 @@
 package checkrisksystem
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
@@ -8,136 +9,59 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-// bothChecksPassed seeds the two intake-check flags stageGate now hard-requires,
-// so the tests below keep exercising stage-token gating specifically rather
-// than tripping over the new dual-check gate.
-func bothChecksPassed() map[common.HString]any {
-	return map[common.HString]any{
+func TestIntakeGateRunsOnceBothChecksPassed(t *testing.T) {
+	data := map[common.HString]any{
 		document.DocProcessAgeCheckPassed:            true,
 		document.DocProcessDuplicatePlateCheckPassed: true,
 	}
-}
-
-func TestStageGate(t *testing.T) {
-	data := bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "customer_verification"
-	if stageGate(nil, data) {
-		t.Fatal("customer verification must wait for birth date")
-	}
-
-	data[document.DocCustomerBirthDate] = "1985-03-15"
-	if !stageGate(nil, data) {
-		t.Fatal("customer verification should run once its gate field is present")
+	if !intakeGate(nil, data) {
+		t.Fatal("must run as soon as both intake checks have passed - no survey data is needed for the first call")
 	}
 }
 
-func TestStageGateFiresImmediatelyForPostSubmission(t *testing.T) {
-	data := bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "post_submission"
-	if !stageGate(nil, data) {
-		t.Fatal("post_submission has no gate fields and must run before any survey")
+func TestIntakeGateBlocksUntilBothChecksPassed(t *testing.T) {
+	cases := []struct {
+		name string
+		data map[common.HString]any
+	}{
+		{"neither check", map[common.HString]any{}},
+		{"only age check", map[common.HString]any{document.DocProcessAgeCheckPassed: true}},
+		{"only duplicate-plate check", map[common.HString]any{document.DocProcessDuplicatePlateCheckPassed: true}},
+		{"age check failed", map[common.HString]any{
+			document.DocProcessAgeCheckPassed:            false,
+			document.DocProcessDuplicatePlateCheckPassed: true,
+		}},
+		{"duplicate-plate check failed", map[common.HString]any{
+			document.DocProcessAgeCheckPassed:            true,
+			document.DocProcessDuplicatePlateCheckPassed: false,
+		}},
+	}
+	for _, tc := range cases {
+		if intakeGate(nil, tc.data) {
+			t.Errorf("%s: must not ask Risk System", tc.name)
+		}
 	}
 }
 
-func TestStageGateSupportsLaterCheckpoints(t *testing.T) {
-	data := bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "asset_review"
-	if stageGate(nil, data) {
-		t.Fatal("asset review must wait for the asset survey's findings")
-	}
-	data[document.DocProcessAssetCondition] = "fair"
-	if !stageGate(nil, data) {
-		t.Fatal("asset review should run once its gate field is present")
-	}
-
-	data = bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "financing"
-	data[document.DocProcessLoanStructureLtvSubmission] = 0.8
-	if !stageGate(nil, data) {
-		t.Fatal("financing should run once the financing survey's findings are present")
-	}
-
-	data[document.DocProcessScoringStageToken] = "complete_normal_survey"
-	data[document.DocProcessIncomeVerifiedAmount] = 15000000.0
-	if !stageGate(nil, data) {
-		t.Fatal("complete_normal_survey should run once the income page's findings are present")
-	}
-
-	data[document.DocProcessScoringStageToken] = "underwriting"
-	data[document.DocProcessUnderwritingConfirmed] = true
-	if !stageGate(nil, data) {
-		t.Fatal("underwriting should run once its confirmation is present")
-	}
-
-	data = bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "financing_confirmation"
-	if stageGate(nil, data) {
-		t.Fatal("financing_confirmation must wait for the normal survey's financing page findings")
-	}
-	data[document.DocProcessLoanStructureLtvSubmission] = 0.8
-	if !stageGate(nil, data) {
-		t.Fatal("financing_confirmation should run once the normal survey's financing page's ltv_submission is present")
-	}
-
-	data = bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "income_confirmation"
-	if stageGate(nil, data) {
-		t.Fatal("income_confirmation must wait for the high_risk survey's income page findings")
-	}
-	data[document.DocProcessIncomeVerifiedAmount] = 15000000.0
-	if !stageGate(nil, data) {
-		t.Fatal("income_confirmation should run once the income page's verified income is present")
-	}
-
-	data = bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "complete_high_risk_survey"
-	if stageGate(nil, data) {
-		t.Fatal("complete_high_risk_survey must wait for the environment_check page's findings")
-	}
-	data[document.DocProcessEnvironmentCheckResult] = "good"
-	if !stageGate(nil, data) {
-		t.Fatal("complete_high_risk_survey should run once the environment_check page's result is present")
-	}
-}
-
-func TestStageGateRejectsUnknownStage(t *testing.T) {
-	data := bothChecksPassed()
-	data[document.DocProcessScoringStageToken] = "future_stage"
-	if stageGate(nil, data) {
-		t.Fatal("unknown stages must fail safe")
-	}
-}
-
-func TestStageGateBlocksUntilBothChecksPassed(t *testing.T) {
-	base := func() map[common.HString]any {
-		return map[common.HString]any{document.DocProcessScoringStageToken: "post_submission"}
-	}
-
-	data := base()
-	data[document.DocProcessAgeCheckPassed] = true
-	if stageGate(nil, data) {
-		t.Fatal("must not run with only the age check passed")
-	}
-
-	data = base()
-	data[document.DocProcessDuplicatePlateCheckPassed] = true
-	if stageGate(nil, data) {
-		t.Fatal("must not run with only the duplicate-plate check passed")
-	}
-
-	data = base()
-	if stageGate(nil, data) {
-		t.Fatal("must not run with neither check passed")
-	}
-}
-
-func TestReadSetUsesCursorAsRequiredTrigger(t *testing.T) {
+// TestEveryReadIsARollbackTrigger pins the re-ask contract: every read path -
+// required and optional - must be a rollback trigger, trigger_seq (bumped by
+// every survey page) must be one of them, and the retired stage_token must
+// not be read at all.
+func TestEveryReadIsARollbackTrigger(t *testing.T) {
 	readSet := common.MakeReadSet(requiredReadSet).SetOptionals(optionalReadSet, true)
 	triggers := readSet.RollbackTriggerPaths()
-	if len(triggers) != len(requiredReadSet) {
-		t.Fatalf("expected only required paths to trigger rollback, got %v", triggers)
+	if len(triggers) != len(requiredReadSet)+len(optionalReadSet) {
+		t.Fatalf("expected every required and optional path to trigger rollback, got %v", triggers)
 	}
-	if triggers[4] != document.DocProcessScoringTriggerSeq {
-		t.Fatalf("expected trigger sequence to be a required rollback path, got %q", triggers[4])
+	for _, path := range optionalReadSet {
+		if !slices.Contains(triggers, path.Path) {
+			t.Errorf("optional path %q must trigger rollback", path.Path)
+		}
+	}
+	if !slices.Contains(triggers, document.DocProcessScoringTriggerSeq) {
+		t.Error("trigger_seq must be a rollback trigger - it's what re-asks RS after a page that only sets first-time data")
+	}
+	if slices.Contains(triggers, document.DocProcessScoringStageToken) {
+		t.Error("retired stage_token must not be read")
 	}
 }

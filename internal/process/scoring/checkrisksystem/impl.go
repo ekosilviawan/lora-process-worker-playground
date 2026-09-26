@@ -17,37 +17,60 @@ import (
 
 const ProcessAndActivityName = "check_risk_system_pg"
 
-// requiredReadSet's last two entries - the intake checks' own verdicts - are
-// dual-placed here and in the precondition below (same treatment as
-// stage_token): stageGate reads their VALUES, not just their presence, to
-// enforce "Risk System is never asked about a submission either check has
-// rejected."
+// requiredReadSet is what LPW's (simulated) call to RS includes, plus the two
+// intake checks' own verdicts and the re-ask counter. Every entry here
+// doubles as a rollback trigger - including the intake flags, whose VALUES
+// (not just presence) intakeGate below also checks, to enforce "Risk System
+// is never asked about a submission either check has rejected."
 //
-// product_type is part of what LPW's (simulated) call to RS includes,
-// alongside the customer identity fields below - RS's own required-data-set
-// decision is made with full knowledge of the loan's product, so a
-// correctly-behaving RS should never request underwriting-v1 for an NDF2W
-// applicant in the first place. checkrisksystemverdict.IsUnderwritingEligible
-// is the backstop for when it does anyway.
+// trigger_seq is the one field whose only job is to re-ask RS. Every survey
+// page bumps it (survey.SurveyPageCompletion), which is a genuine UPDATE -
+// the only kind of write the SDK re-arms an already-run step for
+// (planner.Rollback ignores newly-set fields). Without it, a page that only
+// sets data for the first time (asset, income, environment_check,
+// underwriting) would never re-ask RS; see RISK_SYSTEM_RETRIGGER_OPTIONS.md
+// for why a counter was chosen over the alternatives.
+// seed_scoring_checkpoint_pg seeds it to 0 once intake passes, so page 1's
+// write is already an update, and this step's first call waits for that
+// seed. It also carries the mutual exclusion: it's in survey's writeSet too,
+// and while this step is pending (waiting on RS) it holds a read lock on it,
+// so FieldLock.CanSetWrite keeps survey from locking - and so from opening
+// the next page - until a verdict lands.
+//
+// product_type is sent alongside the customer identity fields - RS's own
+// required-data-set decision is made with full knowledge of the loan's
+// product, so a correctly-behaving RS should never request underwriting-v1
+// for an NDF2W applicant in the first place. survey.IsUnderwritingEligible
+// (enforced in checkrisksystemverdict) is the backstop for when it does
+// anyway.
 var requiredReadSet = []common.HString{
 	document.DocId,
 	document.DocCustomerNik,
 	document.DocCustomerName,
 	document.DocProcessLoanStructureProductType,
 	document.DocProcessScoringTriggerSeq,
-	document.DocProcessScoringStageToken,
 	document.DocProcessAgeCheckPassed,
 	document.DocProcessDuplicatePlateCheckPassed,
 }
 
+// optionalReadSet is the rest of the data RS reviews. Every entry is also a
+// rollback trigger (rearmOnChange), so a later CHANGE to data RS already saw
+// (e.g. a surveyor revising a submitted value) re-asks RS on its own, not
+// only through trigger_seq. A value set for the FIRST time never does that
+// by itself - the SDK only re-queues an already-run step through
+// planner.Rollback, which only considers updated fields, never newly-set ones
+// (runtime/workflow.go's completion handling, versioned_value.go's Set) -
+// which is exactly why the page's trigger_seq bump is needed.
+// data-set/data-forward updates never re-arm this step at all - only
+// activity/task completions do.
 var optionalReadSet = []common.OptionalPath{
-	documentOptional(document.DocCustomerBirthDate),
-	documentOptional(document.DocProcessAssetCondition),
-	documentOptional(document.DocProcessLoanStructureProvisionalAmount),
-	documentOptional(document.DocProcessLoanStructureLtvSubmission),
-	documentOptional(document.DocProcessIncomeVerifiedAmount),
-	documentOptional(document.DocProcessUnderwritingConfirmed),
-	documentOptional(document.DocProcessEnvironmentCheckResult),
+	rearmOnChange(document.DocCustomerBirthDate),
+	rearmOnChange(document.DocProcessAssetCondition),
+	rearmOnChange(document.DocProcessLoanStructureProvisionalAmount),
+	rearmOnChange(document.DocProcessLoanStructureLtvSubmission),
+	rearmOnChange(document.DocProcessIncomeVerifiedAmount),
+	rearmOnChange(document.DocProcessUnderwritingConfirmed),
+	rearmOnChange(document.DocProcessEnvironmentCheckResult),
 }
 
 // writeSet is just "calling RS" 's own output: RS's raw answer, recorded
@@ -59,8 +82,8 @@ var optionalReadSet = []common.OptionalPath{
 // live there: this activity's asyncHandler below only ever receives the raw
 // external payload (runtime.AsyncPayloadHandler), never current document
 // state, so it structurally cannot validate the verdict against the
-// document (e.g. checking stage_token/product_type for the underwriting
-// gate) - see checkrisksystemverdict's package comment for the full reasoning.
+// document (e.g. checking environment_check/product_type for the
+// underwriting gate) - see checkrisksystemverdict's package comment for the full reasoning.
 var writeSet = []common.HString{
 	document.DocProcessScoringRiskSystemRequestId,
 	document.DocProcessScoringRiskSystemStatus,
@@ -69,8 +92,8 @@ var writeSet = []common.HString{
 	document.DocProcessScoringRiskSystemRejectReason,
 }
 
-func documentOptional(path common.HString) common.OptionalPath {
-	return common.OptionalPath{Path: path, Strategy: common.OptionalWaitIfLocked}
+func rearmOnChange(path common.HString) common.OptionalPath {
+	return common.OptionalPath{Path: path, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true}
 }
 
 type Constructor struct {
@@ -141,104 +164,47 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	// - long before a human/testcli ever gets to call "verdict". Matches
 	// survey's own long timeout for the same reason.
 	step.SetTimeout(30 * 24 * time.Hour)
-	// This step is reused for every checkpoint, so a later checkpoint's
-	// trigger_seq/stage_token change (survey advancing the cursor) makes
-	// planner.Rollback treat this step as "impacted" again - and without
-	// this, Rollback would revert every field this step already wrote for
-	// the *completed* checkpoint (the raw risk_system.request_id/status/
-	// required_data_set/max_ltv fields) back to unset, purely as a side
-	// effect of the next checkpoint being armed. That would in turn make
-	// checkrisksystemverdict see those fields as newly-set rather than
+	// This step is reused for every re-ask, so a later data change (e.g. the
+	// financing page revising ltv_submission) makes planner.Rollback treat it
+	// as "impacted" again - and without this, Rollback would revert every
+	// field this step already wrote for the PREVIOUS verdict (the raw
+	// risk_system.request_id/status/required_data_set/max_ltv fields) back to
+	// unset, purely as a side effect of being re-armed. That would in turn
+	// make checkrisksystemverdict see those fields as newly-set rather than
 	// updated on the NEXT verdict, and silently breaks calculateriskfunding's
 	// optional ltv_max read the same way (see checkrisksystemverdict's own
 	// SetRetainDataOnRollback for the continuation of this chain). Matches
 	// survey's own SetRetainDataOnRollback (tasking/survey/impl.go) for the
 	// identical reason.
 	step.SetRetainDataOnRollback()
-	step.SetPrecondition(stageGate, common.MakePreConditionSet(
+	step.SetPrecondition(intakeGate, common.MakePreConditionSet(
 		[]common.HString{
-			document.DocProcessScoringStageToken,
 			document.DocProcessAgeCheckPassed,
 			document.DocProcessDuplicatePlateCheckPassed,
 			document.DocStatus,
 		},
-		[]common.HString{
-			document.DocCustomerBirthDate,
-			document.DocProcessAssetCondition,
-			document.DocProcessLoanStructureLtvSubmission,
-			document.DocProcessIncomeVerifiedAmount,
-			document.DocProcessUnderwritingConfirmed,
-			document.DocProcessEnvironmentCheckResult,
-		},
+		nil,
 	))
-	// Deliberately NOT SetNonDeterministic(): the risk_system.*/survey_type/
-	// stage_token self-loop (this step writes the raw risk_system.* fields ->
-	// checkrisksystemverdict mandatorily reads them and writes survey_type ->
-	// survey mandatorily reads survey_type and writes stage_token -> this
-	// step mandatorily reads stage_token) makes planner.Rollback mark this
-	// step "impacted" again right after every verdict, before stage_token has
-	// actually changed value (Rollback's walk is reachability-based, not
-	// value-diff-based - see planner.go's impactedSteps). With an unchanged
-	// readset, that re-arm is meant to fast-forward via
-	// document.history.MatchInput (workflow.go's doActivityExec) straight
-	// back to the identical verdict just given, instead of opening a second
-	// real pending activity. A genuine re-ask of Risk System (a real
-	// resubmission, e.g. testcli's tc4) always carries a new trigger_seq,
-	// which naturally defeats history-matching on its own - so nothing here
-	// depends on treating this step as non-deterministic.
+	// Deliberately NOT SetNonDeterministic(): planner.Rollback's walk is
+	// reachability-based, not value-diff-based (planner.go's impactedSteps),
+	// so this step can be re-marked "impacted" even when nothing it reads has
+	// actually changed - e.g. a verdict updating ltv_max re-impacts survey,
+	// whose writeSet overlaps this step's reads. With an unchanged readset,
+	// that re-arm fast-forwards via document.history.MatchInput (workflow.go's
+	// doActivityExec) straight back to the identical verdict already given,
+	// instead of opening a second real pending activity. A genuine re-ask of
+	// Risk System always carries a changed input - a new trigger_seq at
+	// minimum - which naturally defeats history-matching on its own.
 	return step
 }
 
-// stageGates maps each cursor stage to the survey field that must exist
-// before Risk System is asked to review that stage. Every stage after
-// post_submission is gated on the field the matching survey_type just
-// collected (see tasking/survey), so the chain never asks RS about data the
-// user has not submitted yet.
-var stageGates = map[string][]common.HString{
-	"post_submission":       nil,
-	"customer_verification": {document.DocCustomerBirthDate},
-	"asset_review":          {document.DocProcessAssetCondition},
-	"financing":             {document.DocProcessLoanStructureLtvSubmission},
-	"underwriting":          {document.DocProcessUnderwritingConfirmed},
-	// financing_confirmation is the checkpoint reached after the multi-page
-	// "normal" survey's third (financing) page; its gate is the field that
-	// page writes, so RS is never asked before all three preceding pages are
-	// in. The survey's fourth and final page (income) then advances the
-	// cursor on to complete_normal_survey.
-	"financing_confirmation": {document.DocProcessLoanStructureLtvSubmission},
-	// complete_normal_survey is the checkpoint reached after the multi-page
-	// "normal" survey's fourth and final (income) page, marking the whole
-	// process as done; its gate is the field that page writes. This is a
-	// dedicated checkpoint, not the retired standalone income_review one.
-	"complete_normal_survey": {document.DocProcessIncomeVerifiedAmount},
-	// income_confirmation is the checkpoint reached after the "high_risk"
-	// survey's fourth (income) page. It shares its gate field with
-	// complete_normal_survey (both pages write the same income field), but is
-	// a distinct checkpoint name since "high_risk" continues to a fifth page
-	// rather than closing the task here.
-	"income_confirmation": {document.DocProcessIncomeVerifiedAmount},
-	// complete_high_risk_survey is the checkpoint reached after the
-	// "high_risk" survey's fifth and final (environment_check) page, marking
-	// the whole high_risk process as done; its gate is the field that page
-	// writes.
-	"complete_high_risk_survey": {document.DocProcessEnvironmentCheckResult},
-}
-
-func stageGate(_ workflow.Context, data map[common.HString]any) bool {
+// intakeGate keeps Risk System from ever being asked about a submission
+// either intake check has rejected: both flags must be present AND true.
+// There is no per-stage gate - whatever data RS sees on a given call is
+// simply whatever the document holds when a page (or a data change) re-asks
+// it.
+func intakeGate(_ workflow.Context, data map[common.HString]any) bool {
 	ageOK, _ := data[document.DocProcessAgeCheckPassed].(bool)
 	plateOK, _ := data[document.DocProcessDuplicatePlateCheckPassed].(bool)
-	if !ageOK || !plateOK {
-		return false
-	}
-	stage, ok := data[document.DocProcessScoringStageToken].(string)
-	if !ok {
-		return false
-	}
-	for _, path := range stageGates[stage] {
-		if _, exists := data[path]; !exists {
-			return false
-		}
-	}
-	_, known := stageGates[stage]
-	return known
+	return ageOK && plateOK
 }

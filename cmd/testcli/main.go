@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,7 @@ import (
 	"go.temporal.io/sdk/converter"
 
 	"lora-process-worker-playground/internal/config"
-	"lora-process-worker-playground/internal/process/document"
+	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
 	"lora-process-worker-playground/internal/process/scoring/checkrisksystemverdict"
 	"lora-process-worker-playground/internal/process/tasking/survey"
 	"lora-process-worker-playground/internal/process/workflow"
@@ -92,7 +93,7 @@ Usage:
   testcli verdict  -id <workflow-id> -dataset <underwriting-v1|survey-normal-v1|survey-high-risk-v1>
                    [-status pending|approved|rejected] [-max-ltv 0] [-reject-reason ..]
   testcli complete-survey -id <workflow-id> -type <underwriting|normal|high_risk>
-                   [-outcome partial|final] [-seq <n>] [-field path=value ...]
+                   [-outcome partial|final] [-field path=value ...]
   testcli tc <tc1|tc2|tc3|tc4|tc5|tc6> [-id <workflow-id>] [-wait 2s]
   testcli describe -id <workflow-id>
 
@@ -108,13 +109,15 @@ financing survey can still revise these later, same as production's surveyor
 negotiation path. "override" overwrites fields that are already set, via this
 worker's own "data-forward-override" handler; "data-set" refuses that outright.
 
-"verdict" delivers a Risk System verdict by completing the pending
-check_risk_system_pg activity directly (client.CompleteActivityByID):
-check_risk_system_pg is a genuine async Temporal activity, so this fails
-outright if Risk System was not (re-)asked (no pending activity to
-complete). It is asked once intake passes, then again after every survey
-page that bumps trigger_seq (see "complete-survey" -seq below). check_risk_system_pg only records the raw
-verdict; a separate check_risk_system_pg_verdict activity then interprets it
+"verdict" delivers a Risk System verdict by completing whichever Risk System
+call is pending (client.CompleteActivityByID). There is one call per data
+set - check_risk_system_pg at intake, then check_risk_system_pg_asset,
+_income, _environment_check and _underwriting, each asked once, the moment
+its survey page first sets that data - and each is a genuine async Temporal
+activity, so this fails outright if no call is pending. The identity and
+financing pages only revise data Risk System saw at intake and ask nothing.
+A Risk System call only records the raw verdict; a separate
+check_risk_system_pg_verdict activity then interprets it
 (required_data_set -> survey_type, status mapping) and, for underwriting-v1,
 checks that the applicant actually completed the high_risk survey and is the
 NDF4W product - if not, that activity errors and retries indefinitely rather
@@ -125,14 +128,9 @@ SURVEY task: survey is a genuine signal-gated Temporal task (system.
 CreateTaskFunction), so nothing else can complete it. A real survey is
 multiple form pages - -outcome partial submits one page and leaves the task
 open (the framework mints a fresh task id for the next page); -outcome final
-(default) submits the last page and closes it. -seq is the trigger_seq value
-to write: every page must write the previous value + 1 (seeded 0, so the Nth
-page submitted writes N) - that update is what re-asks Risk System after the
-page, and re-sending the same value re-asks nothing. A real task completion
-is a self-contained payload with no read access back into the document, so
-the caller (you, or "tc" below) is the source of truth for it. -field
-path=value (repeatable) supplies that page's own data for -outcome partial,
-or overrides the canned outcome for -outcome final.
+(default) submits the last page and closes it. -field path=value
+(repeatable) supplies that page's own data for -outcome partial (at least
+one is required), or overrides the canned outcome for -outcome final.
 
 "tc" starts the workflow itself and replays every step of the named scenario
 from RISK_SYSTEM_POC.md in order, pausing after each one until the worker's
@@ -301,7 +299,6 @@ func cmdCompleteSurvey(ctx context.Context, c client.Client, args []string) erro
 	fs := flag.NewFlagSet("complete-survey", flag.ExitOnError)
 	id := fs.String("id", "", "workflow id (= document id)")
 	surveyType := fs.String("type", "", "survey type (underwriting|normal|high_risk)")
-	seq := fs.Int("seq", 0, "trigger_seq value to write (previous + 1; the Nth page submitted writes N)")
 	outcome := fs.String("outcome", "final", "partial|final - a real survey is multiple form pages; only the final page closes the task")
 	var extra fieldFlags
 	fs.Var(&extra, "field", "raw field override, path=value (repeatable) - the only source of data for -outcome partial (one form page's subset of fields); layered on top of the canned outcome for -outcome final")
@@ -314,8 +311,11 @@ func cmdCompleteSurvey(ctx context.Context, c client.Client, args []string) erro
 	if *outcome != "partial" && *outcome != "final" {
 		return fmt.Errorf("-outcome must be partial or final, got %q", *outcome)
 	}
-	fmt.Printf("complete-survey -> %s: type=%s outcome=%s seq=%d fields=%v\n", *id, *surveyType, *outcome, *seq, extra.parsed())
-	return completeSurvey(ctx, c, *id, *surveyType, *outcome, *seq, extra.parsed())
+	if *outcome == "partial" && len(extra.parsed()) == 0 {
+		return fmt.Errorf("-outcome partial needs at least one -field path=value (the page's own data)")
+	}
+	fmt.Printf("complete-survey -> %s: type=%s outcome=%s fields=%v\n", *id, *surveyType, *outcome, extra.parsed())
+	return completeSurvey(ctx, c, *id, *surveyType, *outcome, extra.parsed())
 }
 
 // completeSurvey simulates a human submitting a page of the currently-open
@@ -324,17 +324,16 @@ func cmdCompleteSurvey(ctx context.Context, c client.Client, args []string) erro
 // pending SURVEY task on it, and sends the same "task-completion" Temporal
 // update a real Task Service would send once a human submits a form page.
 // outcome "partial" sends fieldOverrides (that page's subset of writable
-// fields) plus trigger_seq=seq; outcome "final" sends
-// survey.SurveyOutcomeFields' canned final-page payload (including
-// trigger_seq=seq) with fieldOverrides layered on top, and closes the task.
-func completeSurvey(ctx context.Context, c client.Client, id, surveyType, outcome string, seq int, fieldOverrides map[string]any) error {
+// fields); outcome "final" sends survey.SurveyOutcomeFields' canned
+// final-page payload with fieldOverrides layered on top, and closes the task.
+func completeSurvey(ctx context.Context, c client.Client, id, surveyType, outcome string, fieldOverrides map[string]any) error {
 	var data map[string]any
 	action := taskdefs.OutcomeCompleted
 	if outcome == "partial" {
 		action = taskdefs.OutcomePartial
-		data = mergeCompletionData(map[common.HString]any{document.DocProcessScoringTriggerSeq: seq}, fieldOverrides)
+		data = mergeCompletionData(nil, fieldOverrides)
 	} else {
-		fields, err := survey.SurveyOutcomeFields(surveyType, seq)
+		fields, err := survey.SurveyOutcomeFields(surveyType)
 		if err != nil {
 			return err
 		}
@@ -344,13 +343,11 @@ func completeSurvey(ctx context.Context, c client.Client, id, surveyType, outcom
 }
 
 // completeSurveyPage simulates a human submitting page pageIndex (0-based) of
-// a multi-page survey process: it sends that page's canned findings plus
-// trigger_seq=seq via survey.SurveyPageCompletion. The trigger_seq bump is
-// what re-arms check_risk_system_pg after every page. final marks the last
-// page, which closes the task (the earlier pages stay open as partial
-// completions).
-func completeSurveyPage(ctx context.Context, c client.Client, id, surveyType string, page, seq int, final bool) error {
-	fields, err := survey.SurveyPageCompletion(surveyType, page, seq)
+// a multi-page survey process: it sends that page's canned findings via
+// survey.SurveyPageCompletion. final marks the last page, which closes the
+// task (the earlier pages stay open as partial completions).
+func completeSurveyPage(ctx context.Context, c client.Client, id, surveyType string, page int, final bool) error {
+	fields, err := survey.SurveyPageCompletion(surveyType, page)
 	if err != nil {
 		return err
 	}
@@ -552,12 +549,15 @@ func sendOverride(ctx context.Context, c client.Client, id string, fields map[st
 	})
 }
 
-// sendVerdict delivers a Risk System verdict by completing the pending
-// check_risk_system_pg activity directly. check_risk_system_pg is a genuine
-// async Temporal activity (system.AsyncPayloadHandler) - it goes pending
-// the moment it's scheduled and stays that way until this completes it, so
-// there is structurally nothing to complete unless something (intake, or a
-// page's trigger_seq bump) actually (re-)asked Risk System first.
+// sendVerdict delivers a Risk System verdict by completing whichever Risk
+// System call is pending (checkrisksystem.ActivityNames - never the
+// check_risk_system_pg_verdict interpretation step, which can itself sit
+// pending while it fails and retries, see tc4). Each call is a genuine async
+// Temporal activity (system.AsyncPayloadHandler) - it goes pending the moment
+// it's scheduled and stays that way until this completes it, so there is
+// structurally nothing to complete unless intake or a page's first-time data
+// actually asked Risk System first. The calls are serialized (they write the
+// same risk_system.* fields), so at most one is ever pending.
 //
 // It validates status/dataset before completing: nothing else validates
 // this payload the way a data-forward update's JSON Schema gate used to -
@@ -572,9 +572,9 @@ func sendVerdict(ctx context.Context, c client.Client, id, status, dataset strin
 	if !checkrisksystemverdict.ValidRequiredDataSet(dataset) {
 		return fmt.Errorf("verdict rejected before sending: required_data_set %q is not a recognized value", dataset)
 	}
-	activityID, err := findPendingActivityID(ctx, c, id, "check_risk_system_pg")
+	activityID, err := findPendingActivityID(ctx, c, id, checkrisksystem.ActivityNames())
 	if err != nil {
-		return fmt.Errorf("find pending check_risk_system_pg: %w", err)
+		return fmt.Errorf("find pending Risk System call: %w", err)
 	}
 	payload := map[string]any{
 		"status":            status,
@@ -585,14 +585,14 @@ func sendVerdict(ctx context.Context, c client.Client, id, status, dataset strin
 	return c.CompleteActivityByID(ctx, namespace, id, "", activityID, payload, nil)
 }
 
-// findPendingActivityID polls findPendingActivityIDOnce for a few seconds:
-// check_risk_system_pg becomes pending asynchronously relative to whatever
-// unblocked it (survey completion, seeding), so calling this immediately
-// after waitUntilIdle returns can race ahead of it actually showing up.
-func findPendingActivityID(ctx context.Context, c client.Client, id, activityType string) (string, error) {
+// findPendingActivityID polls findPendingActivityIDOnce for a few seconds: a
+// Risk System call becomes pending asynchronously relative to whatever
+// unblocked it (intake, a survey page), so calling this immediately after
+// waitUntilIdle returns can race ahead of it actually showing up.
+func findPendingActivityID(ctx context.Context, c client.Client, id string, activityTypes []string) (string, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		activityID, err := findPendingActivityIDOnce(ctx, c, id, activityType)
+		activityID, err := findPendingActivityIDOnce(ctx, c, id, activityTypes)
 		if err == nil {
 			return activityID, nil
 		}
@@ -603,17 +603,17 @@ func findPendingActivityID(ctx context.Context, c client.Client, id, activityTyp
 	}
 }
 
-func findPendingActivityIDOnce(ctx context.Context, c client.Client, id, activityType string) (string, error) {
+func findPendingActivityIDOnce(ctx context.Context, c client.Client, id string, activityTypes []string) (string, error) {
 	resp, err := c.DescribeWorkflowExecution(ctx, id, "")
 	if err != nil {
 		return "", err
 	}
 	for _, pa := range resp.PendingActivities {
-		if pa.GetActivityType().GetName() == activityType {
+		if slices.Contains(activityTypes, pa.GetActivityType().GetName()) {
 			return pa.GetActivityId(), nil
 		}
 	}
-	return "", fmt.Errorf("no pending %s activity for workflow %q - Risk System was not re-asked (no trigger_seq bump or other data change since the last verdict), or a verdict was already delivered", activityType, id)
+	return "", fmt.Errorf("no pending Risk System call (%s) for workflow %q - Risk System is asked only at intake and when a page first sets asset.condition, income.verified_amount, environment_check.result or underwriting.confirmed (identity/financing pages ask nothing), once per data set; or a verdict was already delivered", strings.Join(activityTypes, ", "), id)
 }
 
 func sendUpdate(ctx context.Context, c client.Client, id, updateName string, payload map[string]any) error {
@@ -678,19 +678,18 @@ func verdictStep(desc, status, dataset string, maxLTV float64, rejectReason stri
 // completes itself, so every scenario that expects a survey's findings to
 // land must send this after each verdict that advances required_data_set
 // to a new survey_type.
-func surveyCompleteStep(desc, surveyType string, seq int) scenarioStep {
+func surveyCompleteStep(desc, surveyType string) scenarioStep {
 	return scenarioStep{desc: desc, run: func(ctx context.Context, c client.Client, id string) error {
-		return completeSurvey(ctx, c, id, surveyType, "final", seq, nil)
+		return completeSurvey(ctx, c, id, surveyType, "final", nil)
 	}}
 }
 
 // surveyPageStep simulates a human submitting page pageIndex (0-based) of a
-// multi-page survey process, writing trigger_seq=seq on that page. final
-// marks the last page and closes the task; earlier pages stay open as
-// partial completions.
-func surveyPageStep(desc, surveyType string, page, seq int, final bool) scenarioStep {
+// multi-page survey process. final marks the last page and closes the task;
+// earlier pages stay open as partial completions.
+func surveyPageStep(desc, surveyType string, page int, final bool) scenarioStep {
 	return scenarioStep{desc: desc, run: func(ctx context.Context, c client.Client, id string) error {
-		return completeSurveyPage(ctx, c, id, surveyType, page, seq, final)
+		return completeSurveyPage(ctx, c, id, surveyType, page, final)
 	}}
 }
 
@@ -739,110 +738,98 @@ func injectIdentityStepWithProductType(productType string) scenarioStep {
 	}}
 }
 
-// Every scenario below re-asks Risk System after EVERY survey page: each
-// page bumps trigger_seq (seeded 0 by seed_scoring_checkpoint_pg once intake
-// passes, so the Nth page submitted writes N), a required read of
-// check_risk_system_pg (a genuine async Temporal activity, see
-// internal/process/scoring/checkrisksystem, that only records RS's raw
-// verdict; check_risk_system_pg_verdict then interprets it into
-// survey_type/$.status). The bump is what re-asks RS even after a page that
-// only sets data for the first time - the SDK only re-arms an already-run
-// step for an UPDATED field (see RISK_SYSTEM_RETRIGGER_OPTIONS.md). There is
-// no stage_token: survey completion and underwriting eligibility are read
-// straight off collected data. tc1 = normal survey to approval; tc2 =
-// high_risk from the start, on to underwriting and approval; tc3 = normal
-// escalated to high_risk mid-flow without re-collecting shared pages, then
-// underwriting; tc4 = an NDF2W applicant who completes high_risk is still
-// refused underwriting-v1; tc5 = rejected before any survey; tc6 = rejected
-// after the normal survey completes.
+// Every scenario below asks Risk System once per data set, never through a
+// counter: check_risk_system_pg at intake, then check_risk_system_pg_asset,
+// _income, _environment_check and _underwriting, each the moment its page
+// first sets that data (see internal/process/scoring/checkrisksystem). Each
+// is a genuine async Temporal activity that only records RS's raw verdict;
+// check_risk_system_pg_verdict then interprets it into survey_type/$.status.
+// The identity and financing pages only revise data RS already saw at
+// intake, so they ask nothing and the next page follows directly. tc1 =
+// normal survey to approval; tc2 = high_risk from the start, on to
+// underwriting and approval; tc3 = normal escalated to high_risk mid-flow
+// without re-collecting shared pages, then underwriting; tc4 = an NDF2W
+// applicant who completes high_risk is still refused underwriting-v1; tc5 =
+// rejected before any survey; tc6 = rejected after the normal survey
+// completes.
 var scenarios = map[string][]scenarioStep{
 	"tc1": {
 		injectIdentityStep(),
-		verdictStep("post_submission verdict -> survey-normal-v1", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 1 (identity) - partial, trigger_seq=1", "normal", 0, 1, false),
-		verdictStep("page 1 bumped trigger_seq -> check_risk_system_pg re-armed, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 2 (asset) - partial, trigger_seq=2 (asset.condition itself is first-time data)", "normal", 1, 2, false),
-		verdictStep("page 2 bumped trigger_seq -> re-armed even though asset.condition was newly set, verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 3 (financing) - partial, trigger_seq=3", "normal", 2, 3, false),
-		verdictStep("page 3 bumped trigger_seq -> verdict keeps the normal survey going and sets the lending cap (max_ltv=0.6)", "pending", "survey-normal-v1", 0.6, ""),
-		surveyPageStep("normal survey page 4 (income) - final, trigger_seq=4", "normal", 3, 4, true),
-		verdictStep("page 4 bumped trigger_seq -> approved (the normal path never reaches underwriting - that's high_risk-only)", "approved", "survey-normal-v1", 0.6, ""),
-		note("survey-normal-v1 mapped to a single 4-page 'normal' SURVEY process: every page bumped trigger_seq, re-asking check_risk_system_pg, so a verdict followed every page; page 4 closed the task (income.verified_amount is normal's completion field); the terminal verdict repeats required_data_set=survey-normal-v1 rather than requesting underwriting-v1, since underwriting is reachable only from the high_risk path (survey.IsUnderwritingEligible) - status=approved, terminal timestamps set, loan_structure.max_funding=60000. The cap arrives on the page-3 verdict on purpose: page 4's trigger_seq bump is what re-runs calculate_risk_funding_pg under it. A cap first sent or changed on the terminal verdict itself would never be applied - the SDK skips rollback once the planner is terminating."),
+		verdictStep("intake verdict (check_risk_system_pg) -> survey-normal-v1", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 1 (identity) - partial; only revises intake data, so RS is not asked", "normal", 0, false),
+		surveyPageStep("normal survey page 2 (asset) - partial; asset.condition first appears -> check_risk_system_pg_asset asks RS", "normal", 1, false),
+		verdictStep("asset verdict -> keeps the normal survey going and sets the lending cap (max_ltv=0.6)", "pending", "survey-normal-v1", 0.6, ""),
+		surveyPageStep("normal survey page 3 (financing) - partial; revises provisional_amount/ltv_submission, re-runs the funding calculation under the cap, RS is not asked", "normal", 2, false),
+		surveyPageStep("normal survey page 4 (income) - final; income.verified_amount first appears -> check_risk_system_pg_income asks RS", "normal", 3, true),
+		verdictStep("income verdict -> approved (the normal path never reaches underwriting - that's high_risk-only)", "approved", "survey-normal-v1", 0.6, ""),
+		note("survey-normal-v1 mapped to a single 4-page 'normal' SURVEY process; RS was asked at intake and after the asset and income pages (the pages whose data first appeared), never after identity/financing; page 4 closed the task (income.verified_amount is normal's completion field); the terminal verdict repeats required_data_set=survey-normal-v1 rather than requesting underwriting-v1, since underwriting is reachable only from the high_risk path (survey.IsUnderwritingEligible) - status=approved, terminal timestamps set, loan_structure.max_funding=60000. The cap's first appearance ran calculate_risk_funding_pg_capped (54000 off the injected 90000/0.75), and the financing page's revision re-ran both calculations under it (100000 x 0.6). A cap first sent on the terminal verdict itself would never be applied - the planner stops scheduling once $.status is terminal. Every check_risk_system_pg* activity appears at most once in history."),
 	},
 	"tc2": {
 		injectIdentityStep(),
-		verdictStep("post_submission verdict -> survey-high-risk-v1 (RS flags this applicant high risk from the start)", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 1 (identity) - partial, trigger_seq=1", "high_risk", 0, 1, false),
-		verdictStep("page 1 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 2 (asset) - partial, trigger_seq=2", "high_risk", 1, 2, false),
-		verdictStep("page 2 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 3 (financing) - partial, trigger_seq=3", "high_risk", 2, 3, false),
-		verdictStep("page 3 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 4 (income) - partial, trigger_seq=4", "high_risk", 3, 4, false),
-		verdictStep("page 4 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 5 (environment_check) - final, trigger_seq=5", "high_risk", 4, 5, true),
-		verdictStep("page 5 bumped trigger_seq -> underwriting-v1 (max_ltv=0.6 caps the loan; environment_check.result present + product_type=NDF4W satisfy the underwriting gate)", "pending", "underwriting-v1", 0.6, ""),
-		surveyCompleteStep("submit underwriting survey - trigger_seq=6", "underwriting", 6),
-		verdictStep("underwriting page bumped trigger_seq -> approved", "approved", "underwriting-v1", 0.6, ""),
-		note("survey-high-risk-v1 mapped to a single 5-page 'high_risk' SURVEY process from the start: every page bumped trigger_seq, so a verdict followed every page; page 5 closed the task; check_risk_system_pg_verdict then accepted underwriting-v1 since environment_check.result is present and product_type=NDF4W; the underwriting page's own bump re-asked RS for the final approval - status=approved, loan_structure.max_funding=60000"),
+		verdictStep("intake verdict -> survey-high-risk-v1 (RS flags this applicant high risk from the start)", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 1 (identity) - partial; RS is not asked", "high_risk", 0, false),
+		surveyPageStep("high_risk survey page 2 (asset) - partial; asset.condition first appears -> RS asked", "high_risk", 1, false),
+		verdictStep("asset verdict -> keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 3 (financing) - partial; RS is not asked", "high_risk", 2, false),
+		surveyPageStep("high_risk survey page 4 (income) - partial; income.verified_amount first appears -> RS asked", "high_risk", 3, false),
+		verdictStep("income verdict -> keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 5 (environment_check) - final; environment_check.result first appears -> RS asked", "high_risk", 4, true),
+		verdictStep("environment_check verdict -> underwriting-v1 (max_ltv=0.6 caps the loan; environment_check.result present + product_type=NDF4W satisfy the underwriting gate)", "pending", "underwriting-v1", 0.6, ""),
+		surveyCompleteStep("submit underwriting survey; underwriting.confirmed first appears -> RS asked", "underwriting"),
+		verdictStep("underwriting verdict -> approved", "approved", "underwriting-v1", 0.6, ""),
+		note("survey-high-risk-v1 mapped to a single 5-page 'high_risk' SURVEY process from the start; RS was asked after asset, income and environment_check (not identity/financing); page 5 closed the task; check_risk_system_pg_verdict then accepted underwriting-v1 since environment_check.result is present and product_type=NDF4W; the cap first appearing on that verdict ran calculate_risk_funding_pg_capped; the underwriting page's own data asked RS for the final approval - status=approved, loan_structure.max_funding=60000"),
 	},
 	"tc3": {
 		injectIdentityStep(),
-		verdictStep("post_submission verdict -> survey-normal-v1 (starts as a standard applicant)", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 1 (identity) - partial, trigger_seq=1", "normal", 0, 1, false),
-		verdictStep("page 1 bumped trigger_seq -> verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 2 (asset) - partial, trigger_seq=2", "normal", 1, 2, false),
-		verdictStep("page 2's asset condition comes back bad -> RS escalates to survey-high-risk-v1 instead of continuing survey-normal-v1", "pending", "survey-high-risk-v1", 0, ""),
+		verdictStep("intake verdict -> survey-normal-v1 (starts as a standard applicant)", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 1 (identity) - partial; RS is not asked", "normal", 0, false),
+		surveyPageStep("normal survey page 2 (asset) - partial; asset.condition first appears -> RS asked", "normal", 1, false),
+		verdictStep("asset condition comes back bad -> RS escalates to survey-high-risk-v1 instead of continuing survey-normal-v1", "pending", "survey-high-risk-v1", 0, ""),
 		note("survey_type switched from normal to high_risk after the shared asset page; identity/asset/financing are collected identically by both outcomes (standardSurveyPages), so pages 1-2 are NOT re-submitted - shouldCreateTask sees high_risk's completion field (environment_check.result) is still absent and keeps the task open, continuing at high_risk's page 3"),
-		surveyPageStep("high_risk survey page 3 (financing) - partial, trigger_seq=3", "high_risk", 2, 3, false),
-		verdictStep("page 3 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 4 (income) - partial, trigger_seq=4", "high_risk", 3, 4, false),
-		verdictStep("page 4 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 5 (environment_check) - final, trigger_seq=5", "high_risk", 4, 5, true),
-		verdictStep("page 5 bumped trigger_seq -> underwriting-v1 (max_ltv=0.6 caps the loan; environment_check.result present + NDF4W satisfy the underwriting gate)", "pending", "underwriting-v1", 0.6, ""),
-		surveyCompleteStep("submit underwriting survey - trigger_seq=6", "underwriting", 6),
-		verdictStep("underwriting page bumped trigger_seq -> approved", "approved", "underwriting-v1", 0.6, ""),
+		surveyPageStep("high_risk survey page 3 (financing) - partial; RS is not asked", "high_risk", 2, false),
+		surveyPageStep("high_risk survey page 4 (income) - partial; income.verified_amount first appears -> RS asked", "high_risk", 3, false),
+		verdictStep("income verdict -> keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 5 (environment_check) - final; environment_check.result first appears -> RS asked", "high_risk", 4, true),
+		verdictStep("environment_check verdict -> underwriting-v1 (max_ltv=0.6 caps the loan; environment_check.result present + NDF4W satisfy the underwriting gate)", "pending", "underwriting-v1", 0.6, ""),
+		surveyCompleteStep("submit underwriting survey; underwriting.confirmed first appears -> RS asked", "underwriting"),
+		verdictStep("underwriting verdict -> approved", "approved", "underwriting-v1", 0.6, ""),
 		note("mid-flow escalation: normal's first two pages (identity, asset) were reused as-is under high_risk once RS re-assessed the applicant after a bad asset condition - proving the shared pages let a document's survey_type escalate without losing already-collected answers; status=approved, loan_structure.max_funding=60000"),
 	},
 	"tc4": {
 		injectIdentityStepWithProductType("NDF2W"),
-		verdictStep("post_submission verdict -> survey-high-risk-v1 (RS flags this applicant high risk from the start)", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 1 (identity) - partial, trigger_seq=1", "high_risk", 0, 1, false),
-		verdictStep("page 1 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 2 (asset) - partial, trigger_seq=2", "high_risk", 1, 2, false),
-		verdictStep("page 2 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 3 (financing) - partial, trigger_seq=3", "high_risk", 2, 3, false),
-		verdictStep("page 3 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 4 (income) - partial, trigger_seq=4", "high_risk", 3, 4, false),
-		verdictStep("page 4 bumped trigger_seq -> verdict keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
-		surveyPageStep("high_risk survey page 5 (environment_check) - final, trigger_seq=5", "high_risk", 4, 5, true),
-		verdictStep("page 5 bumped trigger_seq -> underwriting-v1 (max_ltv=0.6) - but this applicant is NDF2W", "pending", "underwriting-v1", 0.6, ""),
+		verdictStep("intake verdict -> survey-high-risk-v1 (RS flags this applicant high risk from the start)", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 1 (identity) - partial; RS is not asked", "high_risk", 0, false),
+		surveyPageStep("high_risk survey page 2 (asset) - partial; RS asked", "high_risk", 1, false),
+		verdictStep("asset verdict -> keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 3 (financing) - partial; RS is not asked", "high_risk", 2, false),
+		surveyPageStep("high_risk survey page 4 (income) - partial; RS asked", "high_risk", 3, false),
+		verdictStep("income verdict -> keeps the high_risk survey going", "pending", "survey-high-risk-v1", 0, ""),
+		surveyPageStep("high_risk survey page 5 (environment_check) - final; RS asked", "high_risk", 4, true),
+		verdictStep("environment_check verdict -> underwriting-v1 (max_ltv=0.6) - but this applicant is NDF2W", "pending", "underwriting-v1", 0.6, ""),
 		note("check_risk_system_pg_verdict is now failing/retrying indefinitely for this workflow (environment_check.result is present - the high_risk half of the gate holds - but product_type=NDF2W fails the other half) - check Temporal UI or `describe` to see it as a pending, repeatedly-failing activity rather than a silent stall"),
 		scenarioStep{
 			desc:      "attempt to submit the underwriting survey - expected to fail: NDF2W must never open the underwriting SURVEY task even via the high_risk path",
 			expectErr: true,
 			run: func(ctx context.Context, c client.Client, id string) error {
-				return completeSurvey(ctx, c, id, "underwriting", "final", 6, nil)
+				return completeSurvey(ctx, c, id, "underwriting", "final", nil)
 			},
 		},
 		note("survey_type never became 'underwriting' - check_risk_system_pg_verdict refused to write it, so no underwriting SURVEY task was ever created for this NDF2W applicant; the workflow stalls in status=processing until someone fixes the inconsistency (e.g. a corrected verdict) - confirm via `describe` (pendingActivities includes a failing check_risk_system_pg_verdict)"),
 	},
 	"tc5": {
 		injectIdentityStep(),
-		verdictStep("post_submission verdict -> rejected immediately (RS rejects before any survey is required)", "rejected", "survey-normal-v1", 0, "provisional amount exceeds applicant's income capacity"),
-		note("status=rejected is a terminal state (document.IsTerminalStatus), exactly like approved - doc.SetTermination stops the planner the moment check_risk_system_pg_verdict writes $.status=rejected, even though required_data_set still mapped survey_type=normal in the same write; no SURVEY task is ever created for this applicant. status_reason=the reject reason above, status_timestamps.rejected and status_timestamps.terminal are set, loan_structure.max_funding stays unset. With nothing pending the workflow closes (`describe`: status=Completed)."),
+		verdictStep("intake verdict -> rejected immediately (RS rejects before any survey is required)", "rejected", "survey-normal-v1", 0, "provisional amount exceeds applicant's income capacity"),
+		note("status=rejected is a terminal state (document.IsTerminalStatus), exactly like approved - doc.SetTermination stops the planner the moment check_risk_system_pg_verdict writes $.status=rejected, even though required_data_set still mapped survey_type=normal in the same write; no SURVEY task is ever created for this applicant (create_task_master already ran eagerly at workflow start). status_reason=the reject reason above, status_timestamps.rejected and status_timestamps.terminal are set, loan_structure.max_funding keeps the uncapped 67500 calculate_risk_funding_pg computed at intake. With nothing pending the workflow closes (`describe`: status=Completed)."),
 	},
 	"tc6": {
 		injectIdentityStep(),
-		verdictStep("post_submission verdict -> survey-normal-v1", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 1 (identity) - partial, trigger_seq=1", "normal", 0, 1, false),
-		verdictStep("page 1 bumped trigger_seq -> verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 2 (asset) - partial, trigger_seq=2", "normal", 1, 2, false),
-		verdictStep("page 2 bumped trigger_seq -> verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 3 (financing) - partial, trigger_seq=3", "normal", 2, 3, false),
-		verdictStep("page 3 bumped trigger_seq -> verdict keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
-		surveyPageStep("normal survey page 4 (income) - final, trigger_seq=4", "normal", 3, 4, true),
-		verdictStep("page 4 bumped trigger_seq -> rejected (RS rejects only after reviewing the completed survey)", "rejected", "survey-normal-v1", 0, "verified income insufficient to support requested financing"),
+		verdictStep("intake verdict -> survey-normal-v1", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 1 (identity) - partial; RS is not asked", "normal", 0, false),
+		surveyPageStep("normal survey page 2 (asset) - partial; RS asked", "normal", 1, false),
+		verdictStep("asset verdict -> keeps the normal survey going", "pending", "survey-normal-v1", 0, ""),
+		surveyPageStep("normal survey page 3 (financing) - partial; RS is not asked", "normal", 2, false),
+		surveyPageStep("normal survey page 4 (income) - final; RS asked", "normal", 3, true),
+		verdictStep("income verdict -> rejected (RS rejects only after reviewing the completed survey)", "rejected", "survey-normal-v1", 0, "verified income insufficient to support requested financing"),
 		note("status=rejected is treated identically to approved once mapped (translateStatus/document.SetStatusTimestamp): status_reason=the reject reason above, status_timestamps.rejected and status_timestamps.terminal are set, and the workflow stops exactly as tc1's approval does - the survey task had already closed, so nothing is left pending (`describe`: status=Completed). Unlike tc5, this rejection only arrives after the applicant fully completed the normal survey - proving rejection is a genuine terminal outcome reachable from anywhere in the flow, not just an early fail-fast path."),
 	},
 }

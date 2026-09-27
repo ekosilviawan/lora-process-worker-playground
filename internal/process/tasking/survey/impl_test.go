@@ -2,6 +2,7 @@ package survey
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
@@ -101,45 +102,48 @@ func TestNormalSurveyIsMultiPage(t *testing.T) {
 	}
 }
 
-// TestSurveyPagesBumpTriggerSeq pins the property that re-asks Risk System
-// after every page: each page's payload writes trigger_seq=seq (an update of
-// the previous value, so planner.Rollback re-arms check_risk_system_pg even
-// when the page's own findings are first-time data), and never the retired
-// stage_token.
-func TestSurveyPagesBumpTriggerSeq(t *testing.T) {
+// TestSurveyPagesNeverWriteTriggerSeq pins that no page writes a re-ask
+// cursor: Risk System is re-asked because a page's own data set first
+// appears (see checkrisksystem), so neither the retired trigger_seq nor the
+// retired stage_token is written by any page or listed in writeSet.
+func TestSurveyPagesNeverWriteTriggerSeq(t *testing.T) {
+	for _, retired := range []common.HString{document.DocProcessScoringTriggerSeq, document.DocProcessScoringStageToken} {
+		if slices.Contains(writeSet, retired) {
+			t.Errorf("writeSet must not contain the retired cursor %q", retired)
+		}
+	}
 	for surveyType, outcome := range surveyOutcomesByType {
 		for pageIndex := range outcome.pages {
-			fields, err := SurveyPageCompletion(surveyType, pageIndex, pageIndex+1)
+			fields, err := SurveyPageCompletion(surveyType, pageIndex)
 			if err != nil {
 				t.Fatalf("SurveyPageCompletion(%s, %d): %v", surveyType, pageIndex, err)
 			}
-			if fields[document.DocProcessScoringTriggerSeq] != pageIndex+1 {
-				t.Fatalf("%s page %d trigger_seq = %v, want %d", surveyType, pageIndex, fields[document.DocProcessScoringTriggerSeq], pageIndex+1)
-			}
-			if _, ok := fields[document.DocProcessScoringStageToken]; ok {
-				t.Fatalf("%s page %d must not write the retired stage_token", surveyType, pageIndex)
+			for _, retired := range []common.HString{document.DocProcessScoringTriggerSeq, document.DocProcessScoringStageToken} {
+				if _, ok := fields[retired]; ok {
+					t.Errorf("%s page %d must not write the retired cursor %q", surveyType, pageIndex, retired)
+				}
 			}
 		}
 	}
 }
 
-// TestSurveyPageCompletionIsThePageFindingsPlusTriggerSeq pins that a page
-// payload is that page's own findings plus trigger_seq, nothing more.
-func TestSurveyPageCompletionIsThePageFindingsPlusTriggerSeq(t *testing.T) {
-	fields, err := SurveyPageCompletion("normal", 1, 2)
+// TestSurveyPageCompletionIsThePageFindings pins that a page payload is that
+// page's own findings, nothing more.
+func TestSurveyPageCompletionIsThePageFindings(t *testing.T) {
+	fields, err := SurveyPageCompletion("normal", 1)
 	if err != nil {
 		t.Fatalf("SurveyPageCompletion(normal, 1): %v", err)
 	}
-	if len(fields) != 2 || fields[document.DocProcessAssetCondition] != surveyAssetCondition || fields[document.DocProcessScoringTriggerSeq] != 2 {
-		t.Fatalf("asset page payload = %v, want only asset.condition=%q and trigger_seq=2", fields, surveyAssetCondition)
+	if len(fields) != 1 || fields[document.DocProcessAssetCondition] != surveyAssetCondition {
+		t.Fatalf("asset page payload = %v, want only asset.condition=%q", fields, surveyAssetCondition)
 	}
 }
 
 func TestSurveyPageCompletionRejectsOutOfRangePage(t *testing.T) {
-	if _, err := SurveyPageCompletion("normal", 4, 1); err == nil {
+	if _, err := SurveyPageCompletion("normal", 4); err == nil {
 		t.Fatal("expected an error for an out-of-range page index")
 	}
-	if _, err := SurveyPageCompletion("normal", -1, 1); err == nil {
+	if _, err := SurveyPageCompletion("normal", -1); err == nil {
 		t.Fatal("expected an error for a negative page index")
 	}
 }
@@ -164,7 +168,7 @@ func TestSurveyPagesExposesMultiPageOrder(t *testing.T) {
 }
 
 func TestSurveyOutcomeFieldsIsTheFinalPage(t *testing.T) {
-	fields, err := SurveyOutcomeFields("normal", 4)
+	fields, err := SurveyOutcomeFields("normal")
 	if err != nil {
 		t.Fatalf("SurveyOutcomeFields: %v", err)
 	}
@@ -177,7 +181,7 @@ func TestSurveyOutcomeFieldsIsTheFinalPage(t *testing.T) {
 // guarantee mid-flow escalation depends on: "normal" and "high_risk" must
 // collect identity/asset/financing identically (same name, same fields) so a
 // document whose survey_type switches from "normal" to "high_risk" mid-flow
-// (e.g. after Risk System re-assesses the applicant post-financing-page)
+// (e.g. after Risk System re-assesses the applicant post-asset-page)
 // never has to re-collect an already-submitted page. See
 // standardSurveyPages's own comment for the full reasoning.
 func TestNormalAndHighRiskSharePagesBeforeDiverging(t *testing.T) {
@@ -268,7 +272,7 @@ func TestShouldCreateTaskContinuesAcrossSurveyTypeEscalation(t *testing.T) {
 }
 
 func TestSurveyOutcomeFieldsRejectsUnknownSurveyType(t *testing.T) {
-	if _, err := SurveyOutcomeFields("unknown", 0); err == nil {
+	if _, err := SurveyOutcomeFields("unknown"); err == nil {
 		t.Fatal("expected an error for an unsupported survey type")
 	}
 }

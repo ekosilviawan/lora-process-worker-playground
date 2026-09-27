@@ -1,6 +1,7 @@
 package checkrisksystem
 
 import (
+	"maps"
 	"slices"
 	"testing"
 
@@ -43,25 +44,129 @@ func TestIntakeGateBlocksUntilBothChecksPassed(t *testing.T) {
 	}
 }
 
-// TestEveryReadIsARollbackTrigger pins the re-ask contract: every read path -
-// required and optional - must be a rollback trigger, trigger_seq (bumped by
-// every survey page) must be one of them, and the retired stage_token must
-// not be read at all.
-func TestEveryReadIsARollbackTrigger(t *testing.T) {
-	readSet := common.MakeReadSet(requiredReadSet).SetOptionals(optionalReadSet, true)
-	triggers := readSet.RollbackTriggerPaths()
-	if len(triggers) != len(requiredReadSet)+len(optionalReadSet) {
-		t.Fatalf("expected every required and optional path to trigger rollback, got %v", triggers)
+// TestNoRiskSystemStepHasRollbackTriggers pins the convergence rule: no step
+// that asks Risk System may have a rollback trigger path, so planner.Rollback
+// can never re-queue one and replay an older verdict from history. The
+// retired trigger_seq/stage_token cursors must not be read at all.
+func TestNoRiskSystemStepHasRollbackTriggers(t *testing.T) {
+	rs := readSet()
+	if len(rs.Paths) != 0 {
+		t.Errorf("required reads are always rollback triggers - expected none, got %v", rs.Paths)
 	}
-	for _, path := range optionalReadSet {
-		if !slices.Contains(triggers, path.Path) {
-			t.Errorf("optional path %q must trigger rollback", path.Path)
+	if triggers := rs.RollbackTriggerPaths(); len(triggers) != 0 {
+		t.Errorf("expected no rollback trigger paths, got %v", triggers)
+	}
+	for _, ds := range All {
+		ps := preconditionSet(ds)
+		paths := append(append([]common.HString{}, ps.Paths...), ps.OptionalPaths...)
+		for _, path := range contextReadSet {
+			paths = append(paths, path.Path)
+		}
+		for _, retired := range []common.HString{document.DocProcessScoringTriggerSeq, document.DocProcessScoringStageToken} {
+			if slices.Contains(paths, retired) {
+				t.Errorf("%s: retired cursor %q must not be read", ds.Name, retired)
+			}
 		}
 	}
-	if !slices.Contains(triggers, document.DocProcessScoringTriggerSeq) {
-		t.Error("trigger_seq must be a rollback trigger - it's what re-asks RS after a page that only sets first-time data")
+}
+
+// TestEachDataSetStepGatesOnItsOwnField pins that each step waits for its own
+// data set's field(s) - plus the intake gate every step shares - and that the
+// data-set fields are also sent to RS (precondition data is not part of the
+// activity input).
+func TestEachDataSetStepGatesOnItsOwnField(t *testing.T) {
+	sent := make([]common.HString, 0, len(contextReadSet))
+	for _, path := range contextReadSet {
+		sent = append(sent, path.Path)
 	}
-	if slices.Contains(triggers, document.DocProcessScoringStageToken) {
-		t.Error("retired stage_token must not be read")
+	passed := map[common.HString]any{
+		document.DocProcessAgeCheckPassed:            true,
+		document.DocProcessDuplicatePlateCheckPassed: true,
+		document.DocStatus:                           "new",
+	}
+	for _, ds := range All {
+		if len(ds.Fields) == 0 {
+			t.Errorf("%s: a data set must gate on at least one field", ds.Name)
+		}
+		ps := preconditionSet(ds)
+		for _, field := range intakePreconditionPaths {
+			if !slices.Contains(ps.Paths, field) {
+				t.Errorf("%s: precondition must require %q", ds.Name, field)
+			}
+		}
+		collected := maps.Clone(passed)
+		for _, field := range ds.Fields {
+			if !slices.Contains(ps.OptionalPaths, field) {
+				t.Errorf("%s: precondition must read %q", ds.Name, field)
+			}
+			if !slices.Contains(sent, field) {
+				t.Errorf("%s: data-set field %q must also be sent to RS", ds.Name, field)
+			}
+			collected[field] = "collected"
+		}
+		if dataSetGate(ds)(nil, passed) {
+			t.Errorf("%s: must not ask RS before its data set is collected", ds.Name)
+		}
+		if !dataSetGate(ds)(nil, collected) {
+			t.Errorf("%s: must ask RS once its data set is collected", ds.Name)
+		}
+		collected[document.DocProcessAgeCheckPassed] = false
+		if dataSetGate(ds)(nil, collected) {
+			t.Errorf("%s: must never ask RS about a submission an intake check rejected", ds.Name)
+		}
+	}
+	pageFields := map[common.HString]string{
+		document.DocProcessAssetCondition:         Asset.Name,
+		document.DocProcessIncomeVerifiedAmount:   Income.Name,
+		document.DocProcessEnvironmentCheckResult: EnvironmentCheck.Name,
+		document.DocProcessUnderwritingConfirmed:  Underwriting.Name,
+	}
+	for field, name := range pageFields {
+		owners := 0
+		for _, ds := range All {
+			if slices.Contains(ds.Fields, field) {
+				owners++
+				if ds.Name != name {
+					t.Errorf("%q must gate %s, not %s", field, name, ds.Name)
+				}
+			}
+		}
+		if owners != 1 {
+			t.Errorf("%q must gate exactly one step, got %d", field, owners)
+		}
+	}
+}
+
+// TestRequiredPreconditionPathsAreNotAlsoReads pins an SDK constraint:
+// LockMap.Lock read-locks required precondition paths and optional reads
+// separately, so a field in both is read-locked twice by the same step and
+// panics the workflow task (ErrFieldLockAlreadyHeldById).
+func TestRequiredPreconditionPathsAreNotAlsoReads(t *testing.T) {
+	for _, ds := range All {
+		for _, path := range contextReadSet {
+			if slices.Contains(preconditionSet(ds).Paths, path.Path) {
+				t.Errorf("%s: %q is both a required precondition path and an optional read", ds.Name, path.Path)
+			}
+		}
+	}
+}
+
+func TestActivityNamesAreUniqueAndExcludeVerdict(t *testing.T) {
+	names := ActivityNames()
+	if len(names) != len(All) {
+		t.Fatalf("expected %d names, got %v", len(All), names)
+	}
+	seen := map[string]bool{}
+	for _, name := range names {
+		if seen[name] {
+			t.Errorf("duplicate activity name %q", name)
+		}
+		seen[name] = true
+	}
+	if !seen["check_risk_system_pg"] {
+		t.Error("the intake step must keep its check_risk_system_pg name")
+	}
+	if seen["check_risk_system_pg_verdict"] {
+		t.Error("the verdict step is not a Risk System call and must not be listed")
 	}
 }

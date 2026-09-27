@@ -12,7 +12,6 @@ import (
 	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
 	"lora-process-worker-playground/internal/process/scoring/checkrisksystemverdict"
 	"lora-process-worker-playground/internal/process/scoring/checksubmission"
-	"lora-process-worker-playground/internal/process/scoring/seedscoringcheckpoint"
 	"lora-process-worker-playground/internal/process/tasking/master"
 	"lora-process-worker-playground/internal/process/tasking/survey"
 )
@@ -37,11 +36,17 @@ var registry = []Registriable{
 	&checksubmission.Constructor{},
 	&checkeligibility.Constructor{},
 	&checkduplicateplate.Constructor{},
-	&seedscoringcheckpoint.Constructor{},
 	&survey.Constructor{},
-	&checkrisksystem.Constructor{},
+	// One step per data set that asks Risk System - see checkrisksystem's
+	// package comment.
+	&checkrisksystem.Constructor{DataSet: checkrisksystem.Intake},
+	&checkrisksystem.Constructor{DataSet: checkrisksystem.Asset},
+	&checkrisksystem.Constructor{DataSet: checkrisksystem.Income},
+	&checkrisksystem.Constructor{DataSet: checkrisksystem.EnvironmentCheck},
+	&checkrisksystem.Constructor{DataSet: checkrisksystem.Underwriting},
 	&checkrisksystemverdict.Constructor{},
 	&calculateriskfunding.Constructor{},
+	&calculateriskfunding.CappedConstructor{},
 }
 
 func MakeAllProcessSteps(

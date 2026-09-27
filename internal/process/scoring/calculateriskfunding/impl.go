@@ -14,7 +14,10 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-const ProcessAndActivityName = "calculate_risk_funding_pg"
+const (
+	ProcessAndActivityName       = "calculate_risk_funding_pg"
+	CappedProcessAndActivityName = "calculate_risk_funding_pg_capped"
+)
 
 var readSet = []common.HString{
 	document.DocProcessLoanStructureProvisionalAmount,
@@ -22,23 +25,27 @@ var readSet = []common.HString{
 	document.DocStatus,
 }
 
-// ltvMaxOptional is Risk System's lending cap: absent before RS has ever
-// responded for this submission (this step still runs off submissionLTV
-// alone - an uncapped provisional estimate, mirroring production's
+// ltvMaxOptional is Risk System's lending cap: absent before RS has sent one
+// for this submission (this step still runs off submissionLTV alone - an
+// uncapped provisional estimate, mirroring production's
 // calculate_pre_scoring_ndf2w/4w running before any risk-scoring verdict
 // exists), present and tightening the result from then on. TriggerRollback
-// is true - a deliberate departure from every other optional field in this
-// repo (all default false) - because check_risk_system_pg writes SOME
-// ltv_max value on every verdict starting at post_submission (defaulting to
-// 0 well before the financing stage that actually sets a real cap), so the
-// transition this step must react to is a later VALUE CHANGE to an
-// already-set field, not a first appearance - only an update (not a
-// newly-set field) feeds planner.Rollback. Safe to enable broadly here:
-// this step is ltv_max's only reader, and its own writes are already
-// SetReExecutionNeutral below, so nothing cascades further.
+// is true - a deliberate departure from almost every other optional field in
+// this repo - so a later CHANGE to the cap re-runs this step: only an update
+// (not a newly-set field) feeds planner.Rollback. The cap's FIRST appearance
+// is newly-set and so re-runs nothing here; calculate_risk_funding_pg_capped
+// (CappedConstructor) covers exactly that case. Safe to enable: this step's
+// own writes are SetReExecutionNeutral below, so nothing cascades further.
 var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocProcessLoanStructureLtvMax, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 }
+
+// cappedReadSet is readSet plus the cap as a REQUIRED read, so
+// calculate_risk_funding_pg_capped becomes runnable the moment
+// check_risk_system_pg_verdict first writes ltv_max - the data-set trigger the
+// SDK gives a step that has never run - and, like any required read, re-runs
+// on every later change to it or to the financing fields.
+var cappedReadSet = append(append([]common.HString{}, readSet...), document.DocProcessLoanStructureLtvMax)
 
 var writeSet = []common.HString{
 	document.DocProcessScoringCalculationEffectiveLtv,
@@ -46,6 +53,8 @@ var writeSet = []common.HString{
 	document.DocProcessLoanStructureMaxFunding,
 }
 
+// Constructor is the calculation that runs as soon as the submission's
+// financing data exists, capped by ltv_max whenever one is present.
 type Constructor struct {
 	f *runtime.Function[any, any]
 }
@@ -57,13 +66,46 @@ func (c *Constructor) GenerateFunction(
 	_ *defs.DocumentDescriptor,
 ) error {
 	docFieldCheck(readSet)
-	docFieldCheck(writeSet)
 	for _, path := range optionalReadSet {
 		docFieldCheck([]common.HString{path.Path})
 	}
+	c.f = newFunction(ProcessAndActivityName, common.MakeReadSet(readSet).SetOptionals(optionalReadSet, true), docFieldCheck)
+	return nil
+}
+
+func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
+	return newProcessStep(ProcessAndActivityName, c.f)
+}
+
+// CappedConstructor is the same calculation split out for the cap's data set:
+// see cappedReadSet. The two steps write the same fields, but both are pure
+// functions of the document's current values (both read ltv_max), so
+// whichever runs last writes the correct result, and a history fast-forward
+// of either replays the correct result for identical input.
+type CappedConstructor struct {
+	f *runtime.Function[any, any]
+}
+
+func (c *CappedConstructor) GenerateFunction(
+	_ func(url string) (*framework.APIFunction, error),
+	docFieldCheck func([]common.HString),
+	_ *framework.System,
+	_ *defs.DocumentDescriptor,
+) error {
+	docFieldCheck(cappedReadSet)
+	c.f = newFunction(CappedProcessAndActivityName, common.MakeReadSet(cappedReadSet), docFieldCheck)
+	return nil
+}
+
+func (c *CappedConstructor) GenerateProcessStep() *runtime.ProcessStep {
+	return newProcessStep(CappedProcessAndActivityName, c.f)
+}
+
+func newFunction(name string, rs *common.ReadSet, docFieldCheck func([]common.HString)) *runtime.Function[any, any] {
+	docFieldCheck(writeSet)
 
 	convIn := mapping.NewSimpleInputConverter[map[common.HString]any]()
-	convIn.SetInput(common.MakeReadSet(readSet).SetOptionals(optionalReadSet, true), func(m map[common.HString]any) (*map[common.HString]any, error) { return &m, nil })
+	convIn.SetInput(rs, func(m map[common.HString]any) (*map[common.HString]any, error) { return &m, nil })
 	convOut := mapping.NewSimpleOutputConverter[map[common.HString]any]()
 	convOut.SetOutput(common.MakeWriteSet(writeSet), func(data *map[common.HString]any) (map[common.HString]any, error) { return *data, nil })
 	conv := mapping.NewSimpleConverterFrom(convIn, convOut)
@@ -88,12 +130,11 @@ func (c *Constructor) GenerateFunction(
 		return &out, nil
 	}
 
-	c.f = runtime.NewAnyFunction(ProcessAndActivityName, nil, conv, execFunc, nil)
-	return nil
+	return runtime.NewAnyFunction(name, nil, conv, execFunc, nil)
 }
 
-func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
-	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+func newProcessStep(name runtime.ProcessStepId, f *runtime.Function[any, any]) *runtime.ProcessStep {
+	step := runtime.NewProcessStep(name, f, runtime.Normal, []runtime.ProcessStepId{})
 	step.SetWriteIfEqual(runtime.None, nil)
 	step.SetReExecutionNeutral([]common.HString{document.DocProcessLoanStructureMaxFunding})
 	return step

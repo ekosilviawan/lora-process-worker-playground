@@ -25,9 +25,20 @@ import (
 
 const ProcessAndActivityName = "check_risk_system_pg_verdict"
 
-// requiredReadSet is check_risk_system_pg's own raw recording of RS's
-// verdict - this step doesn't run until that activity has completed.
+// requiredReadSet is the Risk System calls' own raw recording of RS's
+// verdict - this step doesn't run until the first call has completed.
+//
+// request_id is what makes this step interpret EVERY later call, not only
+// those that change status/required_data_set. There is one RS step per data
+// set (see checkrisksystem), all writing these same fields, and each call
+// mints a new request_id - an UPDATE after the first call - so every call
+// re-runs this step through planner.Rollback against the fields' current
+// values: the latest call's. Without it, a call that repeats the previous
+// status/required_data_set but sends a cap for the first time (max_ltv newly
+// set, which re-arms nothing) would never have that cap applied until some
+// later verdict changed status - too late if that one is terminal.
 var requiredReadSet = []common.HString{
+	document.DocProcessScoringRiskSystemRequestId,
 	document.DocProcessScoringRiskSystemRequiredDataSet,
 	document.DocProcessScoringRiskSystemStatus,
 }
@@ -214,12 +225,12 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
 	step.SetWriteIfEqual(runtime.None, nil)
-	// This step sits downstream of every check_risk_system_pg re-ask (see
-	// that step's own SetRetainDataOnRollback comment): a data change that
-	// re-arms check_risk_system_pg also re-impacts this step, since it reads
-	// what that step writes. Without this, that rollback would revert
+	// This step sits downstream of every Risk System call (one per data set,
+	// see checkrisksystem): each later call's verdict updates the
+	// risk_system.* fields this step reads, which makes planner.Rollback
+	// re-impact it. Without this, that rollback would revert
 	// survey_type/$.status/ltv_max back to unset purely as a side effect of
-	// Risk System being re-asked, destroying an already-applied verdict.
+	// Risk System being asked again, destroying an already-applied verdict.
 	step.SetRetainDataOnRollback()
 	// No custom precondition: this step's requiredReadSet
 	// (risk_system.required_data_set/status) is itself the gate, matching

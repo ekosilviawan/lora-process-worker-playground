@@ -30,8 +30,8 @@ const TaskName = "SURVEY"
 // writes survey_type from the verdict's required_data_set, once
 // check_risk_system_pg has recorded it) - transitively this also can't happen before
 // both intake checks have passed, since check_risk_system_pg itself never
-// runs (and so nothing sets survey_type) until seed_scoring_checkpoint_pg has
-// seeded trigger_seq and checkrisksystem.intakeGate sees both checks pass.
+// runs (and so nothing sets survey_type) until checkrisksystem.intakeGate
+// sees both checks pass.
 var readSet = []common.HString{
 	document.DocProcessScoringSurveyType,
 }
@@ -70,19 +70,22 @@ var optionalReadSet = []common.OptionalPath{
 	{Path: document.DocProcessLoanStructureMaxFunding, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
 }
 
-// writeSet is the union of every survey type's findings plus trigger_seq,
-// exactly what a real submitted form's completion payload would contain.
-// Every page bumps trigger_seq, which is what re-asks Risk System after
-// EVERY page: a page that only sets fields for the first time (asset,
-// income, environment_check, underwriting) would otherwise never re-ask it,
-// since the SDK only re-arms an already-run step through planner.Rollback,
-// which ignores newly-set fields (see checkrisksystem's requiredReadSet). Most of these fields are first set here, but provisional_amount/
+// writeSet is the union of every survey type's findings, exactly what a real
+// submitted form's completion payload would contain - no re-ask cursor. A
+// page whose findings are first-time data (asset, income, environment_check,
+// underwriting) re-asks Risk System on its own: each of those fields gates a
+// checkrisksystem step of its own, which becomes runnable the moment the
+// field first appears, and its pending read lock on that field keeps this
+// step from opening the next page until a verdict lands. Most of these
+// fields are first set here, but customer.birth_date/name and
+// provisional_amount/
 // ltv_submission are the exception: they arrive with the initial DP
 // submission (testcli's cmdInject seeds them, mirroring production's
 // pre_scoring - see calculateriskfunding, whose mandatory readSet depends on
 // them existing before any survey runs). The financing outcome below only
 // revises them, matching production's "surveyor negotiation" update path -
-// it does not originate them.
+// it does not originate them. Revising data RS already saw at intake does not
+// re-ask it - the identity and financing pages have no first-time field.
 var writeSet = []common.HString{
 	document.DocCustomerBirthDate,
 	document.DocCustomerName,
@@ -92,7 +95,6 @@ var writeSet = []common.HString{
 	document.DocProcessIncomeVerifiedAmount,
 	document.DocProcessUnderwritingConfirmed,
 	document.DocProcessEnvironmentCheckResult,
-	document.DocProcessScoringTriggerSeq,
 }
 
 // Hardcoded survey findings, one set per survey type - the canned "human"
@@ -148,7 +150,7 @@ func singlePage(name string, fields func() map[common.HString]any) []surveyPage 
 // same fields under every outcome that includes them (today: "normal" and
 // "high_risk") - that's what lets a document's survey_type escalate mid-flow
 // (e.g. "normal" -> "high_risk" once Risk System re-assesses the applicant
-// after the financing page) without re-collecting pages already submitted
+// after the asset page) without re-collecting pages already submitted
 // under the old survey type: shouldCreateTask only ever checks whether the
 // CURRENT survey_type's completionField is present, so data a shared page
 // already collected simply stays collected. Each caller appends its own
@@ -208,10 +210,12 @@ var surveyOutcomesByType = map[string]surveyOutcome{
 	// completions; only the final (income) page closes the task, and its
 	// income.verified_amount is what marks "normal" as done.
 	//
-	// Every page re-asks Risk System (its trigger_seq bump re-arms
-	// check_risk_system_pg). While that re-ask is pending it read-locks
-	// trigger_seq, which is in this step's writeSet, so the next page's task
-	// cannot be re-created until a verdict completes it. The first three pages come
+	// The asset and income pages re-ask Risk System (their fields first
+	// appearing make check_risk_system_pg_asset/_income runnable); while that
+	// call is pending it read-locks the page's field, which is in this step's
+	// writeSet, so the next page's task cannot be re-created until a verdict
+	// completes it. The identity and financing pages only revise data RS saw
+	// at intake, so the survey moves straight on. The first three pages come
 	// from standardSurveyPages() - identity, asset, and financing are
 	// collected identically whether the applicant ends up on "normal" or
 	// "high_risk" (see that function's comment).
@@ -262,41 +266,33 @@ var surveyOutcomesByType = map[string]surveyOutcome{
 // completed survey process produces, for a caller simulating a human
 // submission (cmd/testcli's "complete-survey") to send back as the final
 // task-completion payload. For a multi-page survey this is equivalent to
-// submitting the last page (see SurveyPageCompletion); seq is the
-// trigger_seq value to write, as there.
-func SurveyOutcomeFields(surveyType string, seq int) (map[common.HString]any, error) {
+// submitting the last page (see SurveyPageCompletion).
+func SurveyOutcomeFields(surveyType string) (map[common.HString]any, error) {
 	outcome, ok := surveyOutcomesByType[surveyType]
 	if !ok {
 		return nil, fmt.Errorf("run survey: unsupported survey type %q", surveyType)
 	}
-	return surveyPageCompletion(outcome, len(outcome.pages)-1, seq)
+	return surveyPageCompletion(outcome, len(outcome.pages)-1)
 }
 
 // SurveyPageCompletion returns the document payload for submitting page
-// pageIndex (0-based) of a survey process: that page's own findings plus
-// trigger_seq=seq, which re-asks Risk System after the page. It is the
-// generalisation of SurveyOutcomeFields to any page, so a caller driving a
-// multi-page survey (cmd/testcli) can submit each page in turn. seq must be
-// the previous trigger_seq + 1 (seeded 0, so the Nth page submitted writes
-// N): a genuine task completion is a self-contained payload with no read
-// access back into the document, so the driver (testcli here, LTW in
-// production) is the source of truth for it. Re-sending the same value is
-// not an update and re-asks nothing.
-func SurveyPageCompletion(surveyType string, pageIndex, seq int) (map[common.HString]any, error) {
+// pageIndex (0-based) of a survey process: that page's own findings, nothing
+// more. It is the generalisation of SurveyOutcomeFields to any page, so a
+// caller driving a multi-page survey (cmd/testcli) can submit each page in
+// turn.
+func SurveyPageCompletion(surveyType string, pageIndex int) (map[common.HString]any, error) {
 	outcome, ok := surveyOutcomesByType[surveyType]
 	if !ok {
 		return nil, fmt.Errorf("run survey: unsupported survey type %q", surveyType)
 	}
-	return surveyPageCompletion(outcome, pageIndex, seq)
+	return surveyPageCompletion(outcome, pageIndex)
 }
 
-func surveyPageCompletion(outcome surveyOutcome, pageIndex, seq int) (map[common.HString]any, error) {
+func surveyPageCompletion(outcome surveyOutcome, pageIndex int) (map[common.HString]any, error) {
 	if pageIndex < 0 || pageIndex >= len(outcome.pages) {
 		return nil, fmt.Errorf("run survey: page index %d out of range (survey has %d pages)", pageIndex, len(outcome.pages))
 	}
-	fields := outcome.pages[pageIndex].fields()
-	fields[document.DocProcessScoringTriggerSeq] = seq
-	return fields, nil
+	return outcome.pages[pageIndex].fields(), nil
 }
 
 // SurveyPage is one resolved form page of a survey process, exported so an
@@ -355,8 +351,8 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	if err := step.EnablePartialCompletion(); err != nil {
 		panic(err)
 	}
-	// Once this step is impacted by a rollback (e.g. check_risk_system_pg
-	// re-arming check_risk_system_pg_verdict, which rewrites survey_type -
+	// Once this step is impacted by a rollback (e.g. a later Risk System
+	// verdict re-running check_risk_system_pg_verdict, which rewrites survey_type -
 	// something this step mandatorily reads), planner.Rollback would
 	// otherwise revert every field this step wrote for the *completed*
 	// stage (e.g. wiping the asset survey's own asset.condition back to

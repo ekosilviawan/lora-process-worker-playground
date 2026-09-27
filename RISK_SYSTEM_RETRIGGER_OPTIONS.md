@@ -1,9 +1,17 @@
 # Re-asking Risk System after first-time survey data — design options
 
-Status: **decided — option 1 (`trigger_seq` counter) is implemented** (2026-09-26). `stage_token`
-stays retired, and `trigger_seq` is the only cursor field. This note records why an "updates only"
+Status: **decided — option 3 (one Risk System step per data set) is implemented** (2026-09-26).
+Option 1 (`trigger_seq` counter) was implemented first (`eb55ba6`) and has been replaced; neither
+`trigger_seq` nor `stage_token` is read or written any more. This note records why an "updates only"
 design without any counter was not enough, and which alternatives were weighed, so the choice can be
 revisited.
+
+> **Open concern (2026-09-26): option 3 can leave the final decision stale.** It calls RS only when
+> data first appears, never when data changes, so a flow whose last submission only revises
+> existing fields approves or rejects on data RS never saw. See
+> [Known issues with option 3](#known-issues-with-option-3). This playground's scenarios don't hit
+> it, but its layout can't guarantee production flows won't. Under review; the recommendation is to
+> return to a submission-triggered design (option 1, 2 or 4).
 
 ## The problem (updates-only design, since replaced)
 
@@ -56,7 +64,7 @@ same input writes the same values. So a replayed step cannot restart the chain.
 
 ## Options
 
-### 1. `trigger_seq` counter — chosen, implemented
+### 1. `trigger_seq` counter — implemented first, since replaced by option 3
 
 - **How it works:** `trigger_seq` goes back into `check_risk_system_pg`'s required reads.
   - The survey writes `trigger_seq = previous + 1` on every page, which is a real update, so RS is
@@ -91,17 +99,116 @@ same input writes the same values. So a replayed step cannot restart the chain.
 - **Checked:** the SDK maintains no per-submission document field today. The only internal field it
   writes is `$.internal.taskmaster.id`, which is set once.
 
-### 3. Split RS into one step per data set
+### 3. Split RS into one step per data set — chosen, implemented
 
-- **How it works:** one RS step per data set, each requiring its page's field (`asset.condition`,
-  `income.verified_amount`, ...). A step that has never run becomes runnable as soon as its field
-  first appears, with no counter and no `Rollback`. This is the purest form of data triggering.
-- **Costs:**
-  - Several steps write the same `risk_system.*` fields, so history replay could restore an older
-    verdict, and the verdict step has to tell which call is the latest.
-  - testcli's verdict lookup must match several activity names.
-  - Shared fields (both surveys' income page) and re-submission need special handling.
-- **Verdict:** feasible, but the most fragile option.
+- **How it works:** one RS step per data set, each gated on its page's field: `check_risk_system_pg`
+  (intake), `_asset` (`asset.condition`), `_income` (`income.verified_amount`),
+  `_environment_check` (`environment_check.result`) and `_underwriting` (`underwriting.confirmed`).
+  A step that has never run becomes runnable as soon as its field first appears, with no counter and
+  no `Rollback`. This is the purest form of data triggering.
+- **Why it converges — no RS step has a rollback trigger path.** `impactedSteps` pulls in any step
+  whose required reads, or `TriggerRollback` optional reads, overlap the fields written along the
+  chain, and the survey writes every page field. So each step's data-set field is a *precondition*
+  path instead: read-locked (`lock_map.go` `Lock`) but never in `RollbackTriggerPaths()`, and not
+  part of the activity input (`workflow.go` `doActivityExec`). Everything RS is sent is a
+  non-triggering optional read.
+  - Each RS step therefore runs exactly once and is never re-queued, so it never fast-forwards
+    through history onto an older verdict. That was this option's stated fragility.
+  - The steps all write the same `risk_system.*` fields, so their write locks serialize them. At
+    most one is pending, and the latest write is always the latest call; the verdict step just reads
+    the current values.
+- **Mutual exclusion:** while an RS step is pending it read-locks its page field, which is in the
+  survey's write set, so the next page waits for the verdict (`FieldLock.CanSetWrite`). After a
+  page, the RS step (`Normal`) wins the scheduling round over the survey (`Lazy`).
+- **Costs actually paid:**
+  - The identity and financing pages only revise fields the intake data-set already set, so they
+    have no first-time field and **don't ask RS**. Giving them one would take two new schema fields
+    (option 2's cost).
+  - Re-submitting a page with a changed value doesn't ask RS. A trigger on the page field would
+    reintroduce the replay risk above. See
+    [Known issues with option 3](#known-issues-with-option-3) for why this is more than a cost.
+  - A cap RS sends for the first time is newly set, so it re-ran nothing in
+    `calculate_risk_funding_pg`; under option 1, `trigger_seq` walks had re-run it. It is split the
+    same way: `calculate_risk_funding_pg_capped` requires `ltv_max`, so it runs when the cap first
+    appears. Both calculation steps are pure and both read the cap, so whichever runs last is
+    correct and a replay is harmless. A cap sent only on the terminal verdict is still never applied.
+  - The same rule reached the verdict step. An RS call that repeats the previous `status` and
+    `required_data_set` but sends a cap for the first time (`max_ltv` newly set) updated only
+    `request_id`, which nothing read, so `check_risk_system_pg_verdict` never re-ran. The first
+    end-to-end tc1 run showed this: the asset verdict's cap was applied only on the terminal verdict,
+    too late, leaving `max_funding=80000`. The verdict step now reads `request_id` as a required read.
+    Every call mints a new one, so every call re-runs the verdict step against the latest values. That
+    is how "the verdict step has to tell which call is the latest".
+  - testcli's `verdict` matches the RS steps by name (`checkrisksystem.ActivityNames()`), never
+    `check_risk_system_pg_verdict`.
+  - An SDK constraint shaped the gating. `LockMap.Lock` read-locks required precondition paths and
+    optional reads separately, so a field in both panics the workflow task
+    (`ErrFieldLockAlreadyHeldById`). The data-set fields are therefore *optional* precondition paths,
+    which are de-duplicated against reads, and the precondition function requires them to be present
+    (`TestRequiredPreconditionPathsAreNotAlsoReads`).
+- **Shared fields:** one `_income` step serves both surveys' income page, because
+  `income.verified_amount` first appears once whichever survey collects it.
+- **Evidence (2026-09-26):** TC1–TC6 passed end to end with their full endings, checked against
+  each workflow's Temporal history:
+  - TC1–TC3 ended approved with `max_funding=60000` and `status=Completed`;
+  - TC4 left `check_risk_system_pg_verdict` failing and retrying, and the underwriting submission
+    was rejected;
+  - TC5 and TC6 ended rejected with `status=Completed`.
+
+  In every run, each `check_risk_system_pg*` activity was scheduled exactly once for its data set
+  (TC2/TC3: intake, asset, income, environment_check, underwriting), and at most one RS call was
+  ever pending. There was no `TMPRL1101`. The two calculation steps re-ran a few times each but
+  always converged on the same value (TC1: 67500 at intake → 54000 when the cap appeared → 60000
+  after the financing page).
+
+#### Known issues with option 3
+
+The root cause: option 3 triggers RS on **data first appearing**, not on **a submission
+happening**. A step that has already run is re-queued only by `planner.Rollback`, and an RS step
+with a rollback trigger could replay a stale verdict (see above), so no RS step can ever react to a
+change. Every issue below follows from that.
+
+1. **The final decision can be stale — risk of business loss.** The verdict that approves or
+   rejects is only as fresh as the last RS call, and a call happens only on a page that sets a field
+   for the first time.
+   - In this playground every survey ends on such a page: income for `normal`,
+     environment_check for `high_risk`, and the single-page `underwriting`. That is why TC1–TC6 are
+     correct.
+   - That is a property of this playground's page layout, which the worker can't enforce. A
+     production flow whose last page only revises existing fields would approve or reject on data
+     RS never saw. A final review page, a financing confirmation page, or a later restructuring of
+     pages would all do it. Nothing fails and nothing is logged, so the loan is simply decided on
+     stale data.
+2. **A revised page doesn't call RS.** A surveyor who goes back and re-submits an earlier page
+   changes the document without asking RS. Because every RS call sends the whole current
+   document, the next page that does call RS carries the revision. If no such page follows, the
+   revision is never seen (issue 1).
+3. **Mid-flow decisions act on stale data.** Until the next call, the flow keeps following the
+   verdict RS gave for the old data:
+   - Escalation arrives late. Asset condition revised from `fair` to `poor` after the asset verdict
+     is seen only at the income page, which is `normal`'s final page. RS can still escalate to
+     `high_risk` there, and the survey reopens for environment_check, but a page later than it would
+     under option 1.
+   - A cap RS set from the old data keeps driving `max_funding`, which the underwriting verificator
+     reads to the customer.
+4. **Pages that only revise intake data never call RS.** In this playground those are identity and
+   financing. Giving them a first-time field would take new schema fields, and still would not fix
+   issue 2.
+5. **Out-of-band corrections never call RS, in every option.** `data-set` and
+   `data-forward`/`data-forward-override` updates never call `Rollback`. Whoever makes such an edit
+   must also ask RS.
+
+**What fixes it:**
+- **Trigger on submission, not on first appearance.**
+  - Option 1 (`trigger_seq`) calls RS after every page submission, including a re-submitted page
+    and a final page that only revises fields. It is already implemented at `eb55ba6`.
+  - Option 2 is the same mechanism with a field that has business meaning.
+  - Option 4 makes the same trigger an explicit SDK event.
+  - All three depend on the task side (LTW, or testcli here) reporting every submission.
+- **Defense in depth, for any option: refuse a stale terminal verdict.** Record a fingerprint of the
+  data each RS call sent. `check_risk_system_pg_verdict` then refuses to write `approved`/`rejected`
+  if the document's RS inputs have changed since, and fails visibly the way TC4 does. A stale verdict
+  then becomes a diagnosable stall rather than a wrong decision. Not implemented.
 
 ### 4. Narrow SDK hook: task completion re-queues named steps
 
@@ -120,6 +227,12 @@ same input writes the same values. So a replayed step cannot restart the chain.
 
 ## Decision
 
-Option 1 is implemented. Move to option 2 if a counter with no business meaning becomes
-unacceptable; the mechanism is identical. Revisit option 3 only if the requirement becomes "no
-cursor-like field at all".
+Option 3 is implemented on branch `feat/rs-split-per-data-set` but is **under review** because of
+[Known issues with option 3](#known-issues-with-option-3). Its first-appearance trigger cannot
+guarantee a fresh final decision once a flow ends on a page that only revises data. The
+recommendation is to return to option 1 (or option 2, the same mechanism with a meaningful field) and
+to add the stale-verdict check as defense in depth. Two findings from option 3's run carry over
+regardless:
+- The verdict step reads `risk_system.request_id`, so every RS answer is interpreted, including one
+  that repeats the status and only adds a cap.
+- `LockMap.Lock` panics when a field is both a required precondition path and a read.

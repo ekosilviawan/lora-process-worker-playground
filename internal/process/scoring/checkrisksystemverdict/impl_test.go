@@ -1,6 +1,7 @@
 package checkrisksystemverdict
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
@@ -133,5 +134,15 @@ func TestApplyVerdictOtherSurveyTypesUnaffected(t *testing.T) {
 	}
 	if out[document.DocProcessScoringSurveyType] != "normal" {
 		t.Fatalf("survey_type = %v, want normal", out[document.DocProcessScoringSurveyType])
+	}
+}
+
+// TestRequestIdReArmsVerdict pins that every Risk System call is interpreted:
+// each call mints a new request_id, and only a required (rollback-triggering)
+// read of it re-runs this step for a call that repeats the previous
+// status/required_data_set - e.g. one that only adds a cap.
+func TestRequestIdReArmsVerdict(t *testing.T) {
+	if !slices.Contains(common.MakeReadSet(requiredReadSet).RollbackTriggerPaths(), document.DocProcessScoringRiskSystemRequestId) {
+		t.Fatal("risk_system.request_id must be a rollback-triggering read")
 	}
 }

@@ -37,14 +37,19 @@ var registry = []Registriable{
 	&checkeligibility.Constructor{},
 	&checkduplicateplate.Constructor{},
 	&survey.Constructor{},
-	// One step per data set that asks Risk System - see checkrisksystem's
-	// package comment.
+	// Risk System is asked in stages, one per data set, and every stage's
+	// answer is aggregated into one verdict by an aggregator per stage - see
+	// the checkrisksystem and checkrisksystemverdict package comments.
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.Intake},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.Asset},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.Income},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.EnvironmentCheck},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.Underwriting},
-	&checkrisksystemverdict.Constructor{},
+	&checkrisksystemverdict.Constructor{Stage: checkrisksystem.Intake},
+	&checkrisksystemverdict.Constructor{Stage: checkrisksystem.Asset},
+	&checkrisksystemverdict.Constructor{Stage: checkrisksystem.Income},
+	&checkrisksystemverdict.Constructor{Stage: checkrisksystem.EnvironmentCheck},
+	&checkrisksystemverdict.Constructor{Stage: checkrisksystem.Underwriting},
 	&calculateriskfunding.Constructor{},
 	&calculateriskfunding.CappedConstructor{},
 }

@@ -1,12 +1,14 @@
 package checkrisksystemverdict
 
 import (
+	"maps"
 	"slices"
 	"testing"
 
 	"github.com/bfi-finance/lora-process-sdk/framework/defs/common"
 
 	"lora-process-worker-playground/internal/process/document"
+	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
 )
 
 func TestTranslateStatus(t *testing.T) {
@@ -137,12 +139,92 @@ func TestApplyVerdictOtherSurveyTypesUnaffected(t *testing.T) {
 	}
 }
 
-// TestRequestIdReArmsVerdict pins that every Risk System call is interpreted:
-// each call mints a new request_id, and only a required (rollback-triggering)
-// read of it re-runs this step for a call that repeats the previous
-// status/required_data_set - e.g. one that only adds a cap.
-func TestRequestIdReArmsVerdict(t *testing.T) {
-	if !slices.Contains(common.MakeReadSet(requiredReadSet).RollbackTriggerPaths(), document.DocProcessScoringRiskSystemRequestId) {
-		t.Fatal("risk_system.request_id must be a rollback-triggering read")
+func answer(stage checkrisksystem.DataSet, id, status, dataSet string, maxLTV float64) map[common.HString]any {
+	return map[common.HString]any{
+		stage.Output.RequestId:       id,
+		stage.Output.Status:          status,
+		stage.Output.RequiredDataSet: dataSet,
+		stage.Output.MaxLtv:          maxLTV,
+		stage.Output.RejectReason:    "",
+	}
+}
+
+// TestAggregateMostAdvancedStageWins pins the aggregation rule: the most
+// advanced stage that has answered decides, whatever earlier stages said.
+func TestAggregateMostAdvancedStageWins(t *testing.T) {
+	data := answer(checkrisksystem.Intake, "rs-intake", "pending", "survey-normal-v1", 0)
+	maps.Copy(data, answer(checkrisksystem.Asset, "rs-asset", "pending", "survey-high-risk-v1", 0.6))
+	out, err := aggregate(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[document.DocProcessScoringSurveyType] != "high_risk" || out[document.DocProcessLoanStructureLtvMax] != 0.6 {
+		t.Fatalf("the asset stage must decide over intake, got %v", out)
+	}
+	if out[document.DocProcessScoringRiskSystemRequestId] != "rs-asset" || out[document.DocProcessScoringRiskSystemRequiredDataSet] != "survey-high-risk-v1" {
+		t.Fatalf("risk_system.* must record the deciding stage's answer, got %v", out)
+	}
+
+	// Stage order, not insertion or map order, decides.
+	maps.Copy(data, answer(checkrisksystem.Income, "rs-income", "approved", "survey-normal-v1", 0.6))
+	out, err = aggregate(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[document.DocStatus] != "approved" || out[document.DocProcessScoringRiskSystemRequestId] != "rs-income" {
+		t.Fatalf("the income stage must decide over asset and intake, got %v", out)
+	}
+}
+
+func TestAggregateWithoutAnyAnswerFails(t *testing.T) {
+	if _, err := aggregate(map[common.HString]any{}); err == nil {
+		t.Fatal("aggregating with no stage answer must fail rather than guess")
+	}
+}
+
+// TestAggregateKeepsTheUnderwritingGate pins that the gate applies to the
+// aggregated verdict, naming the deciding stage.
+func TestAggregateKeepsTheUnderwritingGate(t *testing.T) {
+	data := answer(checkrisksystem.EnvironmentCheck, "rs-env", "pending", "underwriting-v1", 0.6)
+	data[document.DocProcessEnvironmentCheckResult] = "good"
+	data[document.DocProcessLoanStructureProductType] = "NDF2W"
+	if _, err := aggregate(data); err == nil {
+		t.Fatal("underwriting-v1 must be refused for an NDF2W applicant")
+	}
+	data[document.DocProcessLoanStructureProductType] = "NDF4W"
+	out, err := aggregate(data)
+	if err != nil || out[document.DocProcessScoringSurveyType] != "underwriting" {
+		t.Fatalf("underwriting-v1 must be accepted for an eligible NDF4W applicant, got %v, %v", out, err)
+	}
+}
+
+// TestEachAggregatorRequiresItsOwnStage pins why there is one aggregator per
+// stage: a stage's first answer is newly-set, which re-arms nothing, so its
+// own aggregator must require it to run at all; and every other stage's
+// answer must be a rollback trigger so later answers re-run it.
+func TestEachAggregatorRequiresItsOwnStage(t *testing.T) {
+	names := map[string]bool{}
+	for _, stage := range checkrisksystem.All {
+		rs := readSet(stage)
+		for _, path := range stage.Output.Paths() {
+			if !slices.Contains(rs.Paths, path) {
+				t.Errorf("%s must require %q", stepName(stage), path)
+			}
+		}
+		triggers := rs.RollbackTriggerPaths()
+		for _, other := range checkrisksystem.All {
+			for _, path := range other.Output.Paths() {
+				if !slices.Contains(triggers, path) {
+					t.Errorf("%s must re-run when %q changes", stepName(stage), path)
+				}
+			}
+		}
+		if names[stepName(stage)] {
+			t.Errorf("duplicate aggregator name %q", stepName(stage))
+		}
+		names[stepName(stage)] = true
+	}
+	if !names[ProcessAndActivityName] {
+		t.Errorf("the intake aggregator must keep the %s name", ProcessAndActivityName)
 	}
 }

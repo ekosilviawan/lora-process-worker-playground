@@ -1,17 +1,12 @@
 # Re-asking Risk System after first-time survey data — design options
 
-Status: **decided — option 3 (one Risk System step per data set) is implemented** (2026-09-26).
-Option 1 (`trigger_seq` counter) was implemented first (`eb55ba6`) and has been replaced; neither
-`trigger_seq` nor `stage_token` is read or written any more. This note records why an "updates only"
-design without any counter was not enough, and which alternatives were weighed, so the choice can be
-revisited.
-
-> **Open concern (2026-09-26): option 3 can leave the final decision stale.** It calls RS only when
-> data first appears, never when data changes, so a flow whose last submission only revises
-> existing fields approves or rejects on data RS never saw. See
-> [Known issues with option 3](#known-issues-with-option-3). This playground's scenarios don't hit
-> it, but its layout can't guarantee production flows won't. Under review; the recommendation is to
-> return to a submission-triggered design (option 1, 2 or 4).
+Status: **decided — option 5 (per-stage Risk System results plus an aggregator) is implemented**
+(2026-09-27). Option 1 (`trigger_seq` counter, `eb55ba6`) and then option 3 (one RS step per data
+set) were implemented first and replaced. Option 3 was dropped because it can leave the final
+decision stale (see [Known issues with option 3](#known-issues-with-option-3)); option 5 fixes that
+without a counter. Neither `trigger_seq` nor `stage_token` is read or written any more. This note
+records why an "updates only" design without any counter was not enough, and which alternatives
+were weighed, so the choice can be revisited.
 
 ## The problem (updates-only design, since replaced)
 
@@ -99,7 +94,7 @@ same input writes the same values. So a replayed step cannot restart the chain.
 - **Checked:** the SDK maintains no per-submission document field today. The only internal field it
   writes is `$.internal.taskmaster.id`, which is set once.
 
-### 3. Split RS into one step per data set — chosen, implemented
+### 3. Split RS into one step per data set — implemented, then replaced by option 5
 
 - **How it works:** one RS step per data set, each gated on its page's field: `check_risk_system_pg`
   (intake), `_asset` (`asset.condition`), `_income` (`income.verified_amount`),
@@ -217,6 +212,77 @@ change. Every issue below follows from that.
   so it avoids the calculator ↔ survey loop.
 - **Cost:** a shared-SDK change, and the design becomes event-driven rather than data-driven.
 
+### 5. Per-stage RS results plus an aggregator — chosen, implemented
+
+Option 3's staging, but each stage is triggered by data **changing** as well as appearing, and
+records its answer on its **own** fields. An aggregator combines the stage answers into the one
+verdict.
+
+- **How it works:**
+  - **Stages** (`checkrisksystem`): `check_risk_system_pg` (intake), `_asset`, `_income`,
+    `_environment_check` and `_underwriting`.
+    - A stage's own data-set fields are **required** reads, so it first runs when its data
+      appears.
+    - Every field of every **earlier** data set is a rollback-triggering optional read. So each
+      call sends everything collected up to that stage, and any later change to that data asks
+      again.
+    - Each stage writes RS's raw answer to `process.scoring.risk_system_stage.<stage>.*`: all five
+      fields on every answer (`max_ltv` 0 and `reject_reason` "" when RS sends none), so after the
+      first answer each later one is an update, never a newly-set write.
+    - A stage **steps aside** once a later stage has answered: its precondition checks the later
+      stages' `request_id`s. The aggregator uses the later answer anyway, and that stage already
+      sends the earlier data, so each change calls RS exactly once.
+  - **Aggregators** (`checkrisksystemverdict`): one per stage, all computing the same pure function.
+    - Rule: the **most advanced stage that has answered decides**. Its call sent everything
+      collected so far, and it is re-asked on any change, so its answer is always the freshest.
+    - Output: the aggregated verdict record (`process.scoring.risk_system.*`) plus its
+      interpretation (`survey_type`, `$.status`, timestamps, `ltv_max`, the underwriting gate).
+    - Why one per stage: a stage's first answer is newly set and re-arms nothing, so only an
+      aggregator that *requires* it runs. The other stages' answers are rollback-triggering,
+      wait-if-locked reads, so later answers re-run every aggregator. They also stop an aggregator
+      from deciding while any stage call is pending.
+- **Why the final decision stays fresh:** freshness is a property of the read sets, not of the page
+  layout. Every field RS is sent belongs to one data set, and the most advanced stage reads all of
+  them with rollback triggers (`TestEveryRiskSystemFieldIsOwnedByOneStage`,
+  `TestEveryReadIsARollbackTrigger`). So any change arriving through an activity or task completion
+  asks RS again before a decision can be made: a revised page (TC7), or a submission that only
+  updates existing fields (TC8), including one on a last page.
+- **Why it converges:** the per-stage outputs remove option 3's replay hazard.
+  - A stage re-queued by the reachability walk with an unchanged input fast-forwards through
+    history, which restores only *its own* answer, for *that* input, into *its own* fields
+    (`TestStageOutputsAreDisjoint`). Identical values aren't updates, so nothing cascades.
+  - Aggregators are pure over the stage answers, so every re-run and every replay writes the same
+    value.
+  - Stages and aggregators retain data on rollback, so no rollback resets a field to unset (the
+    tc1-deadlock mechanism).
+- **Mutual exclusion:** a pending stage read-locks the fields it sends, all in the survey's write
+  set, so the next page waits for the answer. With stepping aside, one call is pending at a time.
+- **Costs:**
+  - New optional LSS schema fields (`risk_system_stage.*`, additive and backward compatible), and
+    ten steps instead of two.
+  - **Aggregators re-run often:** 1–15 aggregator executions per scenario (TC5: 1, TC1: 6, TC7/TC8: 15), all writing identical
+    values. This is cheap, synchronous work.
+  - **RS answers are reused for unchanged input.** A re-queued stage whose input hasn't changed
+    reuses RS's earlier answer instead of calling RS. That's correct only if RS answers the same
+    input the same way; if RS depends on changing external data, the stages would need
+    `SetNonDeterministic()`, at the price of redundant calls.
+  - **The rule is an RS contract assumption.** "Most advanced stage decides" assumes each RS call
+    judges everything sent to it, not only its own data set.
+  - A cap sent only on the terminal verdict is still never applied (as before), and out-of-band
+    `data-set`/`data-forward` edits still never call RS (every option).
+- **Evidence (2026-09-27):** TC1–TC8 passed end to end, checked against each workflow's Temporal
+  history:
+  - TC1–TC3 and TC7 ended approved with `max_funding=60000`;
+  - TC4 left `check_risk_system_pg_verdict_environment_check` failing and retrying, and the
+    underwriting submission was rejected;
+  - TC5 and TC6 ended rejected;
+  - TC7's revised asset page asked RS again at once and escalated to `high_risk`;
+  - TC8's update-only submission asked RS, and its revised `provisional_amount=120000` reached the
+    final decision (`max_funding=72000`, not 60000).
+
+  Every run made exactly one RS call per verdict (e.g. TC1: intake ×2, asset ×2, income ×1), never
+  had more than one RS call pending, and produced no `TMPRL1101` or workflow-task failure.
+
 ### Ruled out
 
 - **Seeding placeholder values into every page field** so that first writes become updates. Survey
@@ -227,12 +293,8 @@ change. Every issue below follows from that.
 
 ## Decision
 
-Option 3 is implemented on branch `feat/rs-split-per-data-set` but is **under review** because of
-[Known issues with option 3](#known-issues-with-option-3). Its first-appearance trigger cannot
-guarantee a fresh final decision once a flow ends on a page that only revises data. The
-recommendation is to return to option 1 (or option 2, the same mechanism with a meaningful field) and
-to add the stale-verdict check as defense in depth. Two findings from option 3's run carry over
-regardless:
-- The verdict step reads `risk_system.request_id`, so every RS answer is interpreted, including one
-  that repeats the status and only adds a cap.
-- `LockMap.Lock` panics when a field is both a required precondition path and a read.
+Option 5 is implemented. It keeps option 3's data-driven staging but triggers on changes as well as
+first appearances, which option 3's shared verdict fields made unsafe. Revisit it if RS's answers
+are not deterministic for identical input (then force real calls), or if RS judges each data set in
+isolation (then the aggregation rule must change). Option 1 remains the simpler fallback: one
+counter and one verdict, at the cost of depending on the task side to report every submission.

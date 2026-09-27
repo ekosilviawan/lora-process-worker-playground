@@ -1,12 +1,33 @@
-// Package checkrisksystemverdict interprets what check_risk_system_pg
-// recorded from Risk System's raw verdict. It exists as a separate,
-// ordinary (synchronous) activity - not folded into checkrisksystem's own
-// async handler - because checkrisksystem's asyncHandler is a
-// runtime.AsyncPayloadHandler (func(map[string]any) (map[common.HString]any,
-// error)): it only ever receives the raw external payload, never current
-// document state. The underwriting eligibility gate below needs
-// environment_check.result and product_type from the document, which only an ordinary activity - with
-// a normal readSet like any other Constructor in this repo - can see.
+// Package checkrisksystemverdict aggregates every Risk System stage's answer
+// (checkrisksystem records one per data set, on its own
+// $.process.scoring.risk_system_stage.<stage>.* fields) into the one Risk
+// System verdict - $.process.scoring.risk_system.* - and interprets it:
+// required_data_set -> survey_type, status -> $.status, terminal timestamps,
+// max_ltv -> ltv_max, and the underwriting eligibility gate. It exists as
+// separate, ordinary (synchronous) activities - not folded into the stages'
+// async handler - because that handler is a runtime.AsyncPayloadHandler
+// (func(map[string]any) (map[common.HString]any, error)): it only ever
+// receives the raw external payload, never current document state. The
+// aggregation needs every stage's answer, and the underwriting gate needs
+// environment_check.result and product_type, which only an ordinary activity
+// - with a normal readSet like any other Constructor in this repo - can see.
+//
+// The aggregation rule: the most advanced stage that has answered wins
+// (checkrisksystem.All's order). That stage's call sent everything collected
+// up to it, and it is re-asked on any change to that data, so its answer is
+// always the one made on the freshest data.
+//
+// There is one aggregator step per stage, all computing the same pure
+// function of every stage's answer. A stage's FIRST answer is newly-set,
+// which re-arms nothing through planner.Rollback, so a single aggregator that
+// had already run would never see it; the stage's own aggregator, which
+// requires that answer, becomes runnable the moment it appears. Later answers
+// are updates (checkrisksystem writes every output field on every answer),
+// which re-run the aggregators through their rollback-triggering reads.
+// Several aggregators writing the same fields is safe for the same reason as
+// calculateriskfunding's two steps: each writes the correct result for the
+// current answers, and a history fast-forward replays the correct result for
+// identical input.
 package checkrisksystemverdict
 
 import (
@@ -20,42 +41,57 @@ import (
 	"github.com/bfi-finance/lora-process-sdk/framework/runtime"
 
 	"lora-process-worker-playground/internal/process/document"
+	"lora-process-worker-playground/internal/process/scoring/checkrisksystem"
 	"lora-process-worker-playground/internal/process/tasking/survey"
 )
 
+// ProcessAndActivityName is the intake stage's aggregator; every other
+// stage's aggregator appends the stage's suffix (see stepName).
 const ProcessAndActivityName = "check_risk_system_pg_verdict"
 
-// requiredReadSet is the Risk System calls' own raw recording of RS's
-// verdict - this step doesn't run until the first call has completed.
-//
-// request_id is what makes this step interpret EVERY later call, not only
-// those that change status/required_data_set. There is one RS step per data
-// set (see checkrisksystem), all writing these same fields, and each call
-// mints a new request_id - an UPDATE after the first call - so every call
-// re-runs this step through planner.Rollback against the fields' current
-// values: the latest call's. Without it, a call that repeats the previous
-// status/required_data_set but sends a cap for the first time (max_ltv newly
-// set, which re-arms nothing) would never have that cap applied until some
-// later verdict changed status - too late if that one is terminal.
-var requiredReadSet = []common.HString{
-	document.DocProcessScoringRiskSystemRequestId,
-	document.DocProcessScoringRiskSystemRequiredDataSet,
-	document.DocProcessScoringRiskSystemStatus,
+// stepName names the aggregator for a stage: check_risk_system_pg_verdict for
+// intake, check_risk_system_pg_verdict_<stage> for the rest, mirroring the
+// stage's own check_risk_system_pg_<stage> name.
+func stepName(stage checkrisksystem.DataSet) string {
+	return ProcessAndActivityName + stage.Name[len(checkrisksystem.Intake.Name):]
 }
 
-// environment_check.result/product_type are read here (not just in survey)
-// because the underwriting eligibility gate below must run BEFORE
-// survey_type is ever written - checkrisksystem's asyncHandler can't check
-// them itself (see the package comment), so this is the only place that can
-// refuse to write survey_type=underwriting for an ineligible applicant.
-var optionalReadSet = []common.OptionalPath{
-	{Path: document.DocProcessScoringRiskSystemMaxLtv, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
-	{Path: document.DocProcessScoringRiskSystemRejectReason, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true},
+// eligibilityReadSet is read (not rollback-triggering) because the
+// underwriting eligibility gate must run BEFORE survey_type is ever written -
+// the stages' async handler can't check it (see the package comment), so this
+// is the only place that can refuse to write survey_type=underwriting for an
+// ineligible applicant.
+var eligibilityReadSet = []common.OptionalPath{
 	{Path: document.DocProcessEnvironmentCheckResult, Strategy: common.OptionalWaitIfLocked},
 	{Path: document.DocProcessLoanStructureProductType, Strategy: common.OptionalWaitIfLocked},
 }
 
+// readSet requires the stage's own answer and reads every other stage's
+// answer as a rollback-triggering optional, wait-if-locked - so an aggregator
+// re-runs on any stage's new answer, and never decides while a stage call is
+// pending (a pending stage write-locks its outputs).
+func readSet(stage checkrisksystem.DataSet) *common.ReadSet {
+	optional := make([]common.OptionalPath, 0)
+	for _, other := range checkrisksystem.All {
+		if other.Name == stage.Name {
+			continue
+		}
+		for _, path := range other.Output.Paths() {
+			optional = append(optional, common.OptionalPath{Path: path, Strategy: common.OptionalWaitIfLocked, TriggerRollback: true})
+		}
+	}
+	optional = append(optional, eligibilityReadSet...)
+	return common.MakeReadSet(stage.Output.Paths()).SetOptionals(optional, true)
+}
+
+// writeSet is the aggregated Risk System verdict record plus its
+// interpretation.
 var writeSet = []common.HString{
+	document.DocProcessScoringRiskSystemRequestId,
+	document.DocProcessScoringRiskSystemStatus,
+	document.DocProcessScoringRiskSystemRequiredDataSet,
+	document.DocProcessScoringRiskSystemMaxLtv,
+	document.DocProcessScoringRiskSystemRejectReason,
 	document.DocStatus,
 	document.DocStatusReason,
 	document.DocProcessStatusTimestampsApproved,
@@ -128,8 +164,10 @@ func ValidRequiredDataSet(dataSet string) bool {
 	return ok
 }
 
+// Constructor builds the aggregator for one stage.
 type Constructor struct {
-	f *runtime.Function[any, any]
+	Stage checkrisksystem.DataSet
+	f     *runtime.Function[any, any]
 }
 
 func (c *Constructor) GenerateFunction(
@@ -138,14 +176,15 @@ func (c *Constructor) GenerateFunction(
 	_ *framework.System,
 	_ *defs.DocumentDescriptor,
 ) error {
-	docFieldCheck(requiredReadSet)
-	docFieldCheck(writeSet)
-	for _, path := range optionalReadSet {
+	rs := readSet(c.Stage)
+	docFieldCheck(rs.Paths)
+	for _, path := range rs.OptionalPaths {
 		docFieldCheck([]common.HString{path.Path})
 	}
+	docFieldCheck(writeSet)
 
 	convIn := mapping.NewSimpleInputConverter[map[common.HString]any]()
-	convIn.SetInput(common.MakeReadSet(requiredReadSet).SetOptionals(optionalReadSet, true), func(m map[common.HString]any) (*map[common.HString]any, error) {
+	convIn.SetInput(rs, func(m map[common.HString]any) (*map[common.HString]any, error) {
 		return &m, nil
 	})
 	convOut := mapping.NewSimpleOutputConverter[map[common.HString]any]()
@@ -155,15 +194,55 @@ func (c *Constructor) GenerateFunction(
 	conv := mapping.NewSimpleConverterFrom(convIn, convOut)
 
 	execFunc := func(_ context.Context, data *map[common.HString]any) (*map[common.HString]any, error) {
-		out, err := applyVerdict(*data)
+		out, err := aggregate(*data)
 		if err != nil {
 			return nil, err
 		}
 		return &out, nil
 	}
 
-	c.f = runtime.NewAnyFunction(ProcessAndActivityName, nil, conv, execFunc, nil)
+	c.f = runtime.NewAnyFunction(stepName(c.Stage), nil, conv, execFunc, nil)
 	return nil
+}
+
+// aggregate picks the most advanced stage that has answered, records its
+// answer as the Risk System verdict (risk_system.*) and interprets it.
+func aggregate(data map[common.HString]any) (map[common.HString]any, error) {
+	var winner *checkrisksystem.DataSet
+	for i := len(checkrisksystem.All) - 1; i >= 0; i-- {
+		if _, answered := data[checkrisksystem.All[i].Output.Status]; answered {
+			winner = &checkrisksystem.All[i]
+			break
+		}
+	}
+	if winner == nil {
+		return nil, fmt.Errorf("check risk system verdict: no stage has answered")
+	}
+
+	verdict := map[common.HString]any{
+		document.DocProcessScoringRiskSystemRequestId:       data[winner.Output.RequestId],
+		document.DocProcessScoringRiskSystemStatus:          data[winner.Output.Status],
+		document.DocProcessScoringRiskSystemRequiredDataSet: data[winner.Output.RequiredDataSet],
+		document.DocProcessScoringRiskSystemMaxLtv:          data[winner.Output.MaxLtv],
+		document.DocProcessScoringRiskSystemRejectReason:    data[winner.Output.RejectReason],
+	}
+	interpreted := map[common.HString]any{}
+	for k, v := range verdict {
+		interpreted[k] = v
+	}
+	for _, path := range eligibilityReadSet {
+		if v, ok := data[path.Path]; ok {
+			interpreted[path.Path] = v
+		}
+	}
+	out, err := applyVerdict(interpreted)
+	if err != nil {
+		return nil, fmt.Errorf("%w (deciding stage: %s)", err, winner.Name)
+	}
+	for k, v := range verdict {
+		out[k] = v
+	}
+	return out, nil
 }
 
 // applyVerdict is execFunc's actual logic, pulled out as a plain function so
@@ -223,18 +302,15 @@ func applyVerdict(data map[common.HString]any) (map[common.HString]any, error) {
 }
 
 func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
-	step := runtime.NewProcessStep(ProcessAndActivityName, c.f, runtime.Normal, []runtime.ProcessStepId{})
+	step := runtime.NewProcessStep(runtime.ProcessStepId(stepName(c.Stage)), c.f, runtime.Normal, []runtime.ProcessStepId{})
 	step.SetWriteIfEqual(runtime.None, nil)
-	// This step sits downstream of every Risk System call (one per data set,
-	// see checkrisksystem): each later call's verdict updates the
-	// risk_system.* fields this step reads, which makes planner.Rollback
-	// re-impact it. Without this, that rollback would revert
+	// Aggregators sit downstream of every stage and are re-impacted whenever
+	// a stage answers again. Without this, that rollback would revert
 	// survey_type/$.status/ltv_max back to unset purely as a side effect of
 	// Risk System being asked again, destroying an already-applied verdict.
 	step.SetRetainDataOnRollback()
-	// No custom precondition: this step's requiredReadSet
-	// (risk_system.required_data_set/status) is itself the gate, matching
-	// calculateriskfunding's own lack of an explicit SetPrecondition - it
-	// simply doesn't run until checkrisksystem has recorded a verdict.
+	// No custom precondition: the stage's own answer (the required reads) is
+	// the gate - the aggregator simply doesn't run until that stage has
+	// answered.
 	return step
 }

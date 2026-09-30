@@ -29,8 +29,8 @@ const TaskName = "SURVEY"
 // to complete next (checkrisksystemverdict.check_risk_system_pg_verdict
 // writes survey_type from the verdict's required_data_set, once
 // check_risk_system_pg has recorded it) - transitively this also can't happen before
-// both intake checks have passed, since check_risk_system_pg itself never
-// runs (and so nothing sets survey_type) until checkrisksystem.intakeGate
+// both initial checks have passed, since check_risk_system_pg itself never
+// runs (and so nothing sets survey_type) until checkrisksystem.initialGate
 // sees both checks pass.
 var readSet = []common.HString{
 	document.DocProcessScoringSurveyType,
@@ -71,9 +71,9 @@ var optionalReadSet = []common.OptionalPath{
 }
 
 // writeSet is the union of every survey type's findings, exactly what a real
-// submitted form's completion payload would contain - no re-ask cursor. A
+// submitted form's completion payload would contain - no re-trigger cursor. A
 // page whose findings are first-time data (asset, income, environment_check,
-// underwriting) re-asks Risk System on its own: each of those fields gates a
+// underwriting) asks Risk System on its own: each of those fields gates a
 // checkrisksystem step of its own, which becomes runnable the moment the
 // field first appears, and its pending read lock on that field keeps this
 // step from opening the next page until a verdict lands. Most of these
@@ -84,8 +84,9 @@ var optionalReadSet = []common.OptionalPath{
 // pre_scoring - see calculateriskfunding, whose mandatory readSet depends on
 // them existing before any survey runs). The financing outcome below only
 // revises them, matching production's "surveyor negotiation" update path -
-// it does not originate them. Revising data RS already saw at intake does not
-// re-ask it - the identity and financing pages have no first-time field.
+// it does not originate them. Revising data RS was already sent re-triggers
+// it: those fields are rollback-triggering reads of every checkrisksystem
+// stage, and the most advanced stage that has answered asks again.
 var writeSet = []common.HString{
 	document.DocCustomerBirthDate,
 	document.DocCustomerName,
@@ -210,12 +211,13 @@ var surveyOutcomesByType = map[string]surveyOutcome{
 	// completions; only the final (income) page closes the task, and its
 	// income.verified_amount is what marks "normal" as done.
 	//
-	// The asset and income pages re-ask Risk System (their fields first
-	// appearing make check_risk_system_pg_asset/_income runnable); while that
-	// call is pending it read-locks the page's field, which is in this step's
-	// writeSet, so the next page's task cannot be re-created until a verdict
-	// completes it. The identity and financing pages only revise data RS saw
-	// at intake, so the survey moves straight on. The first three pages come
+	// Every page asks Risk System: the asset and income pages because their
+	// fields first appearing make check_risk_system_pg_asset/_income runnable,
+	// the identity and financing pages because they revise data RS was
+	// already sent, which re-triggers the most advanced stage so far. While
+	// that call is pending it read-locks fields in this step's writeSet, so
+	// the next page's task cannot be re-created until a verdict completes
+	// it. The first three pages come
 	// from standardSurveyPages() - identity, asset, and financing are
 	// collected identically whether the applicant ends up on "normal" or
 	// "high_risk" (see that function's comment).

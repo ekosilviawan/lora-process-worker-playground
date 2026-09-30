@@ -1,7 +1,6 @@
 package checkrisksystem
 
 import (
-	"maps"
 	"slices"
 	"testing"
 
@@ -10,17 +9,17 @@ import (
 	"lora-process-worker-playground/internal/process/document"
 )
 
-func TestIntakeGateRunsOnceBothChecksPassed(t *testing.T) {
+func TestInitialGateRunsOnceBothChecksPassed(t *testing.T) {
 	data := map[common.HString]any{
 		document.DocProcessAgeCheckPassed:            true,
 		document.DocProcessDuplicatePlateCheckPassed: true,
 	}
-	if !intakeGate(nil, data) {
-		t.Fatal("must run as soon as both intake checks have passed - no survey data is needed for the first call")
+	if !initialGate(nil, data) {
+		t.Fatal("must run as soon as both initial checks have passed - no survey data is needed for the first call")
 	}
 }
 
-func TestIntakeGateBlocksUntilBothChecksPassed(t *testing.T) {
+func TestInitialGateBlocksUntilBothChecksPassed(t *testing.T) {
 	cases := []struct {
 		name string
 		data map[common.HString]any
@@ -38,23 +37,48 @@ func TestIntakeGateBlocksUntilBothChecksPassed(t *testing.T) {
 		}},
 	}
 	for _, tc := range cases {
-		if intakeGate(nil, tc.data) {
+		if initialGate(nil, tc.data) {
 			t.Errorf("%s: must not ask Risk System", tc.name)
 		}
 	}
 }
 
-// TestNoRiskSystemStepHasRollbackTriggers pins the convergence rule: no step
-// that asks Risk System may have a rollback trigger path, so planner.Rollback
-// can never re-queue one and replay an older verdict from history. The
-// retired trigger_seq/stage_token cursors must not be read at all.
-func TestNoRiskSystemStepHasRollbackTriggers(t *testing.T) {
-	rs := readSet()
-	if len(rs.Paths) != 0 {
-		t.Errorf("required reads are always rollback triggers - expected none, got %v", rs.Paths)
-	}
-	if triggers := rs.RollbackTriggerPaths(); len(triggers) != 0 {
-		t.Errorf("expected no rollback trigger paths, got %v", triggers)
+// TestRollbackTriggersAreEverythingCollectedSoFar pins option 3's trigger
+// rule: a stage is re-triggered by the submission's fields and every data-set
+// field up to and including its own, and by nothing else - the later stages'
+// fields are sent but never trigger. Every field RS is sent is read exactly
+// once, either way. The retired trigger_seq/stage_token cursors must not be
+// read at all.
+func TestRollbackTriggersAreEverythingCollectedSoFar(t *testing.T) {
+	for i, ds := range All {
+		rs := readSet(ds)
+		want := append([]common.HString{}, submissionFields...)
+		for _, earlier := range All[:i+1] {
+			want = append(want, earlier.Fields...)
+		}
+		triggers := rs.RollbackTriggerPaths()
+		for _, field := range want {
+			if !slices.Contains(triggers, field) {
+				t.Errorf("%s: a change to %q must re-trigger it", ds.Name, field)
+			}
+		}
+		for _, field := range triggers {
+			if !slices.Contains(want, field) {
+				t.Errorf("%s: %q belongs to a later stage and must not re-trigger it", ds.Name, field)
+			}
+		}
+		read := slices.Clone(rs.Paths)
+		for _, path := range rs.OptionalPaths {
+			if slices.Contains(read, path.Path) {
+				t.Errorf("%s: %q is both a required and an optional read", ds.Name, path.Path)
+			}
+			read = append(read, path.Path)
+		}
+		for _, path := range contextReadSet {
+			if !slices.Contains(read, path.Path) {
+				t.Errorf("%s: %q must be sent to RS", ds.Name, path.Path)
+			}
+		}
 	}
 	for _, ds := range All {
 		ps := preconditionSet(ds)
@@ -71,48 +95,23 @@ func TestNoRiskSystemStepHasRollbackTriggers(t *testing.T) {
 }
 
 // TestEachDataSetStepGatesOnItsOwnField pins that each step waits for its own
-// data set's field(s) - plus the intake gate every step shares - and that the
-// data-set fields are also sent to RS (precondition data is not part of the
-// activity input).
+// data set's field(s) - a required read, so it is also sent to RS - plus the
+// initial gate every step shares.
 func TestEachDataSetStepGatesOnItsOwnField(t *testing.T) {
-	sent := make([]common.HString, 0, len(contextReadSet))
-	for _, path := range contextReadSet {
-		sent = append(sent, path.Path)
-	}
-	passed := map[common.HString]any{
-		document.DocProcessAgeCheckPassed:            true,
-		document.DocProcessDuplicatePlateCheckPassed: true,
-		document.DocStatus:                           "new",
-	}
 	for _, ds := range All {
 		if len(ds.Fields) == 0 {
 			t.Errorf("%s: a data set must gate on at least one field", ds.Name)
 		}
 		ps := preconditionSet(ds)
-		for _, field := range intakePreconditionPaths {
+		for _, field := range initialPreconditionPaths {
 			if !slices.Contains(ps.Paths, field) {
 				t.Errorf("%s: precondition must require %q", ds.Name, field)
 			}
 		}
-		collected := maps.Clone(passed)
 		for _, field := range ds.Fields {
-			if !slices.Contains(ps.OptionalPaths, field) {
-				t.Errorf("%s: precondition must read %q", ds.Name, field)
+			if !slices.Contains(readSet(ds).Paths, field) {
+				t.Errorf("%s: data-set field %q must be a required read", ds.Name, field)
 			}
-			if !slices.Contains(sent, field) {
-				t.Errorf("%s: data-set field %q must also be sent to RS", ds.Name, field)
-			}
-			collected[field] = "collected"
-		}
-		if dataSetGate(ds)(nil, passed) {
-			t.Errorf("%s: must not ask RS before its data set is collected", ds.Name)
-		}
-		if !dataSetGate(ds)(nil, collected) {
-			t.Errorf("%s: must ask RS once its data set is collected", ds.Name)
-		}
-		collected[document.DocProcessAgeCheckPassed] = false
-		if dataSetGate(ds)(nil, collected) {
-			t.Errorf("%s: must never ask RS about a submission an intake check rejected", ds.Name)
 		}
 	}
 	pageFields := map[common.HString]string{
@@ -164,9 +163,57 @@ func TestActivityNamesAreUniqueAndExcludeVerdict(t *testing.T) {
 		seen[name] = true
 	}
 	if !seen["check_risk_system_pg"] {
-		t.Error("the intake step must keep its check_risk_system_pg name")
+		t.Error("the initial step must keep its check_risk_system_pg name")
 	}
 	if seen["check_risk_system_pg_verdict"] {
 		t.Error("the verdict step is not a Risk System call and must not be listed")
+	}
+}
+
+// TestEarlierStagesStepAsideForTheMostAdvanced pins the step-aside rule: once
+// a stage has answered, only it and later stages may ask RS - so a change
+// that re-queues several stages asks RS exactly once, through the most
+// advanced one.
+func TestEarlierStagesStepAsideForTheMostAdvanced(t *testing.T) {
+	for i, ds := range All {
+		if !notSuperseded(ds, map[common.HString]any{}) {
+			t.Errorf("%s: must run before any stage has answered", ds.Name)
+		}
+		for j, answered := range All {
+			data := map[common.HString]any{document.DocProcessScoringRiskSystemMostAdvancedStage: answered.Name}
+			if got, want := notSuperseded(ds, data), j <= i; got != want {
+				t.Errorf("%s after %s answered: notSuperseded = %v, want %v", ds.Name, answered.Name, got, want)
+			}
+		}
+		unknown := map[common.HString]any{document.DocProcessScoringRiskSystemMostAdvancedStage: "check_risk_system_pg_unknown"}
+		if !notSuperseded(ds, unknown) {
+			t.Errorf("%s: an unknown stage name must not make it step aside", ds.Name)
+		}
+	}
+}
+
+// TestMostAdvancedStageIsRecordedButNeverATrigger pins how the step-aside
+// field is wired: every stage writes it and reads it as an optional
+// precondition path (unset until the first answer), and no stage reads it as
+// data, so recording a new stage re-queues nothing.
+func TestMostAdvancedStageIsRecordedButNeverATrigger(t *testing.T) {
+	field := common.HString(document.DocProcessScoringRiskSystemMostAdvancedStage)
+	if !slices.Contains(writeSet, field) {
+		t.Errorf("%q must be written with every answer", field)
+	}
+	for _, ds := range All {
+		ps := preconditionSet(ds)
+		if !slices.Contains(ps.OptionalPaths, field) || slices.Contains(ps.Paths, field) {
+			t.Errorf("%s: %q must be an optional precondition path", ds.Name, field)
+		}
+		rs := readSet(ds)
+		if slices.Contains(rs.Paths, field) || slices.Contains(rs.RollbackTriggerPaths(), field) {
+			t.Errorf("%s: %q must not be read as data or trigger a rollback", ds.Name, field)
+		}
+		for _, path := range rs.OptionalPaths {
+			if path.Path == field {
+				t.Errorf("%s: %q must not be sent to RS", ds.Name, field)
+			}
+		}
 	}
 }

@@ -1,22 +1,36 @@
-// Package checkrisksystem asks Risk System (RS) once per data set: one
-// process step per data set (intake, asset, income, environment_check,
-// underwriting), each gated on that data set's own field first appearing in
-// the document. There is no re-ask counter - RS is asked because data
-// appeared, not because a cursor moved (option 3 in
-// RISK_SYSTEM_RETRIGGER_OPTIONS.md).
+// Package checkrisksystem is option 3 in RISK_SYSTEM_RETRIGGER_OPTIONS.md: one
+// process step per data set (initial, asset, income, environment_check,
+// underwriting) that asks Risk System (RS). There is no re-trigger counter -
+// RS is asked because data appeared or changed, not because a cursor moved:
 //
-// The one rule that makes this converge: no step here has a single rollback
-// trigger path. A step's data-set field sits in its PRECONDITION (as an
-// optional precondition path, which dataSetGate then requires to be present),
-// which the planner read-locks (lock_map.go's Lock) but never treats as a
-// rollback trigger (common.ReadSet.RollbackTriggerPaths only covers required
-// reads and TriggerRollback optionals), and everything RS is sent is read as
-// a non-triggering optional. So planner.Rollback's reachability walk
-// (planner.go's impactedSteps) can never pull one of these steps back in:
-// each runs exactly once, when its field first appears, and so never
-// fast-forwards through document history onto a verdict older than the one
-// another step has since recorded. That is the fragility the options doc
-// warned about for several steps writing the same risk_system.* fields.
+//   - A step first runs when its own data-set field first appears: that field
+//     is a required read, and a newly set field makes the step runnable.
+//
+//   - It is re-triggered when any field already collected by its stage changes:
+//     the submission's fields and every data-set field up to and including its
+//     own are required reads (readSet), and a required read is always a
+//     rollback trigger (common.ReadSet.RollbackTriggerPaths), so an update to
+//     one re-queues the step through planner.Rollback.
+//
+//   - Only the most advanced stage that has answered is re-triggered. A change
+//     re-queues every stage that reads it (planner.go's impactedSteps walks
+//     forward from the earliest reader), so each stage records itself in
+//     risk_system.most_advanced_stage with its answer, and an earlier stage's
+//     precondition (notSuperseded) makes it step aside once a later one has
+//     answered. The most advanced stage already sends every earlier stage's
+//     data, so each change asks RS exactly once.
+//
+// All's order is therefore load-bearing: a stage requires every earlier
+// stage's field, so it only runs on a path that has collected all of them,
+// and its position ranks it for stepping aside.
+//
+// Why a replay can't restore a stale verdict onto the shared risk_system.*
+// fields: the only stage that can re-run is the one that recorded the current
+// verdict. If its input is unchanged it fast-forwards through history onto
+// its own answer for that input. (So a value changed and then changed back
+// reuses RS's earlier answer for it - correct only if RS answers the same
+// input the same way.) A re-submission with identical values is not an
+// update, so it asks nothing.
 //
 // Two more properties fall out of the SDK's locking rather than any code
 // here:
@@ -27,15 +41,11 @@
 //     page until a verdict lands. After a page's partial completion this
 //     step (runtime.Normal) always wins the scheduling round over survey
 //     (runtime.Lazy).
-//
-// The costs, accepted deliberately: pages that only revise data RS already
-// saw at intake (identity: customer.name/birth_date; financing:
-// provisional_amount/ltv_submission) have no first-time field and so do not
-// re-ask RS, and neither does re-submitting a page with a changed value.
 package checkrisksystem
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/bfi-finance/lora-process-sdk/framework"
@@ -58,10 +68,10 @@ type DataSet struct {
 }
 
 var (
-	// Intake is the first call, before any survey runs: it waits only for the
+	// Initial is the first call, before any survey runs: it waits only for the
 	// customer identity and product the initial submission carries (plus the
-	// intake gate every data set shares, see intakePreconditionPaths).
-	Intake = DataSet{
+	// initial gate every data set shares, see initialPreconditionPaths).
+	Initial = DataSet{
 		Name: "check_risk_system_pg",
 		Fields: []common.HString{
 			document.DocId,
@@ -91,9 +101,10 @@ var (
 	}
 )
 
-// All lists every data set that asks Risk System, in the order a document
-// normally meets them.
-var All = []DataSet{Intake, Asset, Income, EnvironmentCheck, Underwriting}
+// All lists every data set that asks Risk System, in the order every survey
+// path collects them. The order matters: each stage requires, and is
+// re-triggered by, the fields of every stage before it (requiredFields).
+var All = []DataSet{Initial, Asset, Income, EnvironmentCheck, Underwriting}
 
 // ActivityNames returns the Temporal activity type of every step that asks
 // Risk System - what a caller delivering a verdict (cmd/testcli's "verdict")
@@ -108,27 +119,24 @@ func ActivityNames() []string {
 	return names
 }
 
-// intakePreconditionPaths gate every data set, not only Intake: Risk System
-// is never asked about a submission either intake check has rejected, even if
+// initialPreconditionPaths gate every data set, not only Initial: Risk System
+// is never asked about a submission either initial check has rejected, even if
 // a page field were injected by hand before the checks ran. $.status makes
 // every step wait for check_submission_pg, like every other non-exempt
 // activity.
-var intakePreconditionPaths = []common.HString{
+var initialPreconditionPaths = []common.HString{
 	document.DocProcessAgeCheckPassed,
 	document.DocProcessDuplicatePlateCheckPassed,
 	document.DocStatus,
 }
 
-// contextReadSet is everything LPW's (simulated) call to RS includes, read as
-// non-triggering optionals so each call still sends whatever the document
-// holds at that moment. None of them may be a rollback trigger (see the
-// package comment) - including the data-set fields themselves, which is why
-// they gate through the precondition instead. None of them may be a REQUIRED
-// precondition path either: LockMap.Lock read-locks required precondition
-// paths and optional reads separately, and a field in both is read-locked
-// twice by the same step, which panics (ErrFieldLockAlreadyHeldById). Optional
-// precondition paths are de-duplicated against optional reads, which is why
-// the data-set fields are optional precondition paths.
+// contextReadSet is everything LPW's (simulated) call to RS includes. readSet
+// splits it per stage into required, rollback-triggering reads and
+// non-triggering optional reads, so each call sends whatever the document
+// holds at that moment. None of them may be a REQUIRED precondition path:
+// LockMap.Lock read-locks required precondition paths and optional reads
+// separately, and a field in both is read-locked twice by the same step, which
+// panics (ErrFieldLockAlreadyHeldById).
 //
 // product_type is sent alongside the customer identity fields - RS's own
 // required-data-set decision is made with full knowledge of the loan's
@@ -152,8 +160,10 @@ var contextReadSet = []common.OptionalPath{
 
 // writeSet is just "calling RS" 's own output: RS's raw answer, recorded
 // verbatim onto its own $.process.scoring.risk_system.* fields. Every data
-// set writes the same fields, so the latest write is always the latest call
-// (the steps are serialized and never replay). This activity does NOT
+// set writes the same fields, and the steps are serialized, so the latest
+// write is the latest call. most_advanced_stage is written alongside the
+// answer: the stage's own name, which earlier stages step aside for (see
+// notSuperseded). This activity does NOT
 // interpret the verdict (map required_data_set to survey_type, translate
 // status, or decide underwriting eligibility) - that happens in
 // checkrisksystemverdict.check_risk_system_pg_verdict, an ordinary
@@ -169,25 +179,67 @@ var writeSet = []common.HString{
 	document.DocProcessScoringRiskSystemRequiredDataSet,
 	document.DocProcessScoringRiskSystemMaxLtv,
 	document.DocProcessScoringRiskSystemRejectReason,
+	document.DocProcessScoringRiskSystemMostAdvancedStage,
 }
 
 func sendToRiskSystem(path common.HString) common.OptionalPath {
 	return common.OptionalPath{Path: path, Strategy: common.OptionalWaitIfLocked}
 }
 
-// readSet has no required paths at all: a required read is always a rollback
-// trigger.
-func readSet() *common.ReadSet {
-	return common.MakeReadSet([]common.HString{}).SetOptionals(contextReadSet, true)
+// readSet is option 3's trigger rule: every field that already exists when a
+// stage runs is a REQUIRED read - so it gates the stage and is a rollback
+// trigger - and only the fields of later stages, which can't exist yet, stay
+// non-triggering optional reads. A field is never both.
+//
+// "Already exists" means: the submission's fields (submissionFields), plus the
+// data-set fields of this stage and of every stage before it in All.
+func readSet(ds DataSet) *common.ReadSet {
+	required := requiredFields(ds)
+	optional := make([]common.OptionalPath, 0, len(contextReadSet))
+	for _, path := range contextReadSet {
+		if !slices.Contains(required, path.Path) {
+			optional = append(optional, path)
+		}
+	}
+	return common.MakeReadSet(required).SetOptionals(optional, true)
 }
 
-// preconditionSet requires the intake gate's fields and lists the data-set
-// fields as optional paths - dataSetGate is what makes them mandatory (see
-// contextReadSet for why they can't be required paths).
-func preconditionSet(ds DataSet) *common.PreConditionSet {
+// submissionFields are sent to RS and always present from the initial
+// submission, beyond Initial's own fields: birth_date (the age check that the
+// initial gate requires reads it) and the requested loan structure (which
+// calculate_risk_funding_pg already requires).
+var submissionFields = []common.HString{
+	document.DocCustomerBirthDate,
+	document.DocProcessLoanStructureProvisionalAmount,
+	document.DocProcessLoanStructureLtvSubmission,
+}
+
+// requiredFields returns submissionFields plus the data-set fields of ds and
+// of every data set before it in All.
+func requiredFields(ds DataSet) []common.HString {
+	required := append([]common.HString{}, submissionFields...)
+	for _, earlier := range All {
+		for _, f := range earlier.Fields {
+			if !slices.Contains(required, f) {
+				required = append(required, f)
+			}
+		}
+		if earlier.Name == ds.Name {
+			break
+		}
+	}
+	return required
+}
+
+// preconditionSet requires the initial gate's fields (the data-set fields are
+// required reads, which already guarantees they are present) and reads
+// most_advanced_stage for notSuperseded. That is an optional path, since it
+// is unset until the first answer, and never a read: precondition paths are
+// never rollback triggers, so a new stage recording itself re-queues nothing.
+func preconditionSet(_ DataSet) *common.PreConditionSet {
 	return common.MakePreConditionSet(
-		append([]common.HString{}, intakePreconditionPaths...),
-		append([]common.HString{}, ds.Fields...),
+		append([]common.HString{}, initialPreconditionPaths...),
+		[]common.HString{document.DocProcessScoringRiskSystemMostAdvancedStage},
 	)
 }
 
@@ -211,7 +263,7 @@ func (c *Constructor) GenerateFunction(
 	}
 
 	convIn := mapping.NewSimpleInputConverter[map[common.HString]any]()
-	convIn.SetInput(readSet(), func(m map[common.HString]any) (*map[common.HString]any, error) { return &m, nil })
+	convIn.SetInput(readSet(c.DataSet), func(m map[common.HString]any) (*map[common.HString]any, error) { return &m, nil })
 	convOut := mapping.NewSimpleOutputConverter[map[common.HString]any]()
 	convOut.SetOutput(common.MakeWriteSet(writeSet), func(data *map[common.HString]any) (map[common.HString]any, error) { return *data, nil })
 	conv := mapping.NewSimpleConverterFrom(convIn, convOut)
@@ -235,9 +287,10 @@ func (c *Constructor) GenerateFunction(
 		rejectReason, _ := raw["reject_reason"].(string)
 
 		out := map[common.HString]any{
-			document.DocProcessScoringRiskSystemRequestId:       "playground-rs-" + uuid.New().String(),
-			document.DocProcessScoringRiskSystemStatus:          status,
-			document.DocProcessScoringRiskSystemRequiredDataSet: requiredDataSet,
+			document.DocProcessScoringRiskSystemRequestId:         "playground-rs-" + uuid.New().String(),
+			document.DocProcessScoringRiskSystemStatus:            status,
+			document.DocProcessScoringRiskSystemRequiredDataSet:   requiredDataSet,
+			document.DocProcessScoringRiskSystemMostAdvancedStage: c.DataSet.Name,
 		}
 		if maxLTV > 0 {
 			out[document.DocProcessScoringRiskSystemMaxLtv] = maxLTV
@@ -261,35 +314,43 @@ func (c *Constructor) GenerateProcessStep() *runtime.ProcessStep {
 	// - long before a human/testcli ever gets to call "verdict". Matches
 	// survey's own long timeout for the same reason.
 	step.SetTimeout(30 * 24 * time.Hour)
-	// With no rollback trigger paths this step is never "impacted", so
-	// neither this nor history matching should ever come into play. It stays
-	// as a guard: if a trigger path were ever added, a rollback would neither
-	// revert an already-recorded verdict nor cancel a pending RS call.
+	// A re-triggered step keeps the verdict it recorded until the new call
+	// answers: a rollback doesn't revert risk_system.* to an older value or
+	// reset it to unset.
 	step.SetRetainDataOnRollback()
-	step.SetPrecondition(dataSetGate(c.DataSet), preconditionSet(c.DataSet))
+	step.SetPrecondition(precondition(c.DataSet), preconditionSet(c.DataSet))
 	return step
 }
 
-// dataSetGate is a data set's precondition: the intake gate holds and every
-// one of the data set's fields is present - i.e. that data has been
-// collected.
-func dataSetGate(ds DataSet) func(workflow.Context, map[common.HString]any) bool {
+// precondition is a stage's gate beyond its required reads: the initial gate
+// holds and no later stage has answered yet.
+func precondition(ds DataSet) func(workflow.Context, map[common.HString]any) bool {
 	return func(ctx workflow.Context, data map[common.HString]any) bool {
-		if !intakeGate(ctx, data) {
-			return false
-		}
-		for _, field := range ds.Fields {
-			if _, ok := data[field]; !ok {
-				return false
-			}
-		}
-		return true
+		return initialGate(ctx, data) && notSuperseded(ds, data)
 	}
 }
 
-// intakeGate keeps Risk System from ever being asked about a submission
-// either intake check has rejected: both flags must be present AND true.
-func intakeGate(_ workflow.Context, data map[common.HString]any) bool {
+// notSuperseded makes a stage step aside once a later stage in All has
+// answered: most_advanced_stage is unset (nobody has answered) or names this
+// stage or an earlier one. It only ever moves forward - a stage runs only
+// when it is at least as advanced as the recorded one, and records itself.
+// A name All doesn't know (e.g. written by a newer worker) supersedes
+// nothing: an extra RS call sends current data, whereas stepping aside could
+// leave nobody to ask.
+func notSuperseded(ds DataSet, data map[common.HString]any) bool {
+	latest, _ := data[document.DocProcessScoringRiskSystemMostAdvancedStage].(string)
+	latestRank := slices.IndexFunc(All, func(d DataSet) bool { return d.Name == latest })
+	return latestRank <= stageRank(ds)
+}
+
+// stageRank is ds's position in All.
+func stageRank(ds DataSet) int {
+	return slices.IndexFunc(All, func(d DataSet) bool { return d.Name == ds.Name })
+}
+
+// initialGate keeps Risk System from ever being asked about a submission
+// either initial check has rejected: both flags must be present AND true.
+func initialGate(_ workflow.Context, data map[common.HString]any) bool {
 	ageOK, _ := data[document.DocProcessAgeCheckPassed].(bool)
 	plateOK, _ := data[document.DocProcessDuplicatePlateCheckPassed].(bool)
 	return ageOK && plateOK

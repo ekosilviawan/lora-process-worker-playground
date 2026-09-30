@@ -49,6 +49,12 @@ func AdjustAndMakeDocumentDescriptor(fields map[common.HString]*defs.FieldDescri
 	// same treatment if its own $.status read turns out to be gate-only too.
 	fields[DocStatus].SetReExecNeutral(true)
 	fields[DocStatusReason].SetReExecNeutral(true)
+	// most_advanced_stage is bookkeeping for checkrisksystem's step-aside
+	// precondition, never data a step depends on. Only precondition paths
+	// read it today, and those are never rollback triggers, so this is a
+	// guard: a later step reading it as a trigger still can't start a
+	// rollback each time a new stage records itself.
+	fields[DocProcessScoringRiskSystemMostAdvancedStage].SetReExecNeutral(true)
 
 	doc := defs.NewDocumentDescriptorFromFields(fields)
 	doc.SetTermination(termination())

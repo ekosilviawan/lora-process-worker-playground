@@ -93,7 +93,7 @@ func TestNormalSurveyIsMultiPage(t *testing.T) {
 
 	financing := outcome.pages[2].fields()
 	if _, ok := financing[document.DocProcessLoanStructureLtvSubmission]; !ok {
-		t.Fatal("normal survey's third page must revise ltv_submission (what re-asks Risk System after it)")
+		t.Fatal("normal survey's third page must revise ltv_submission (what re-triggers Risk System after it)")
 	}
 
 	income := outcome.pages[3].fields()
@@ -102,9 +102,9 @@ func TestNormalSurveyIsMultiPage(t *testing.T) {
 	}
 }
 
-// TestSurveyPagesNeverWriteTriggerSeq pins that no page writes a re-ask
-// cursor: Risk System is re-asked because a page's own data set first
-// appears (see checkrisksystem), so neither the retired trigger_seq nor the
+// TestSurveyPagesNeverWriteTriggerSeq pins that no page writes a re-trigger
+// cursor: Risk System is re-triggered because a page's data appears or changes
+// (see checkrisksystem), so neither the retired trigger_seq nor the
 // retired stage_token is written by any page or listed in writeSet.
 func TestSurveyPagesNeverWriteTriggerSeq(t *testing.T) {
 	for _, retired := range []common.HString{document.DocProcessScoringTriggerSeq, document.DocProcessScoringStageToken} {

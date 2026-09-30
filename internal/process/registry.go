@@ -39,7 +39,7 @@ var registry = []Registriable{
 	&survey.Constructor{},
 	// One step per data set that asks Risk System - see checkrisksystem's
 	// package comment.
-	&checkrisksystem.Constructor{DataSet: checkrisksystem.Intake},
+	&checkrisksystem.Constructor{DataSet: checkrisksystem.Initial},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.Asset},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.Income},
 	&checkrisksystem.Constructor{DataSet: checkrisksystem.EnvironmentCheck},
